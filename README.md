@@ -50,8 +50,14 @@ python3 scripts/run_segment_sweep.py \
   --output results/h100_segment_sweep.csv
 ```
 
+The benchmark now preserves five ablation modes: `scalar`, `cp_async`,
+`tma_bulk`, fixed-footprint `tma_tiled`, and the two-stage producer/consumer
+`tma_pipeline`. On H20, the pipeline is intended for 64 KiB and larger
+segments; smaller segments retain the lighter paths.
+
 The benchmark emits measured data only.  It exits instead of silently labeling
 a non-Hopper path as TMA when `sm_90a` support is absent.
 
 See `docs/h20_initial_results.md` for the first H20 measurements and Nsight
-diagnosis, and `docs/experiment_plan.md` for hypotheses and follow-up work.
+diagnosis, `docs/hopper_dynamic_graph_research.md` for the CPU-to-Hopper research
+roadmap, and `docs/experiment_plan.md` for the original experiment plan.

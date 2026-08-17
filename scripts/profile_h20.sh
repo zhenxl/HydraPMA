@@ -27,10 +27,22 @@ CUDA_VISIBLE_DEVICES="${profile_gpu}" "${ncu_bin}" \
   -filename "${result_dir}/slabhash_mixed_update_ncu.json"
 
 for segment_bytes in 8192 16384 32768; do
-  for mode in cp_async tma; do
+  for mode in cp_async tma tma_tiled; do
     CUDA_VISIBLE_DEVICES="${profile_gpu}" "${ncu_bin}" \
       --set full --kernel-name-base demangled \
-      --kernel-name 'regex:redistribute_kernel' --launch-count 1 \
+      --kernel-name 'regex:redistribute' --launch-count 1 \
+      --force-overwrite \
+      -o "${result_dir}/segment_${segment_bytes}_${mode}_ncu" \
+      "${segment_bin}" --segment-bytes "${segment_bytes}" --density 0.75 \
+      --working-set-mb 16 --warmup 0 --iterations 1 --mode "${mode}"
+  done
+done
+
+for segment_bytes in 65536 98304; do
+  for mode in cp_async tma tma_tiled tma_pipeline; do
+    CUDA_VISIBLE_DEVICES="${profile_gpu}" "${ncu_bin}" \
+      --set full --kernel-name-base demangled \
+      --kernel-name 'regex:redistribute' --launch-count 1 \
       --force-overwrite \
       -o "${result_dir}/segment_${segment_bytes}_${mode}_ncu" \
       "${segment_bin}" --segment-bytes "${segment_bytes}" --density 0.75 \

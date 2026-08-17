@@ -22,6 +22,9 @@ static_assert(sizeof(Entry) == 16, "bulk copies require 16-byte entries");
 constexpr std::uint64_t kEmpty = ~std::uint64_t{0};
 constexpr int kThreads = 256;
 constexpr int kMaxBulkBytes = 16 * 1024;
+constexpr std::size_t kTileEntries = kMaxBulkBytes / sizeof(Entry);
+constexpr int kProducerThreads = 32;
+constexpr int kConsumerThreads = kThreads - kProducerThreads;
 
 #define CUDA_CHECK(call)                                                        \
   do {                                                                          \
@@ -32,7 +35,7 @@ constexpr int kMaxBulkBytes = 16 * 1024;
     }                                                                            \
   } while (0)
 
-enum class Mode { kScalar, kCpAsync, kTma };
+enum class Mode { kScalar, kCpAsync, kTma, kTmaTiled, kTmaPipeline };
 
 struct Options {
   std::size_t segment_bytes = 4096;
@@ -116,16 +119,22 @@ __device__ __forceinline__ void bulk_s2g(void* gmem, const void* smem,
                : "memory");
 }
 
-__device__ __forceinline__ void bulk_store_commit_wait() {
-  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-  asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
-  asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+__device__ __forceinline__ void consumer_barrier() {
+  asm volatile("bar.sync 1, %0;\n"
+               :
+               : "r"(kConsumerThreads)
+               : "memory");
 }
 #endif
 
 __host__ __device__ __forceinline__ std::size_t redistributed_position(
     std::size_t live_index, std::size_t capacity, std::size_t live_count) {
   return (live_index * capacity) / live_count;
+}
+
+__host__ __device__ __forceinline__ std::size_t ceil_div(
+    std::size_t numerator, std::size_t denominator) {
+  return (numerator + denominator - 1) / denominator;
 }
 
 __global__ void initialize_input(Entry* input, Entry* output,
@@ -219,6 +228,199 @@ __global__ void redistribute_kernel(const Entry* input, Entry* output,
   }
 }
 
+// Fixed-footprint TMA path. Each CTA walks one PMA segment as a sequence of
+// output tiles. The compact live prefix needed by an output tile is contiguous,
+// so one bulk load feeds a cooperative gap-placement pass and one bulk store.
+// This is intentionally a single-stage ablation: it isolates the occupancy
+// effect before producer/consumer overlap is added.
+__global__ void redistribute_tma_tiled_kernel(const Entry* input, Entry* output,
+                                              std::size_t capacity,
+                                              std::size_t live_count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  extern __shared__ __align__(16) unsigned char storage[];
+  Entry* stage_in = reinterpret_cast<Entry*>(storage);
+  Entry* stage_out = stage_in + kTileEntries;
+  const Entry* segment_in = input + std::size_t(blockIdx.x) * capacity;
+  Entry* segment_out = output + std::size_t(blockIdx.x) * capacity;
+  __shared__ __align__(8) std::uint64_t barrier;
+
+  for (std::size_t output_begin = 0; output_begin < capacity;
+       output_begin += kTileEntries) {
+    const std::size_t output_end =
+        min(capacity, output_begin + kTileEntries);
+    const std::size_t output_entries = output_end - output_begin;
+    const std::size_t input_begin =
+        ceil_div(output_begin * live_count, capacity);
+    const std::size_t input_end =
+        min(live_count, ceil_div(output_end * live_count, capacity));
+    const std::size_t input_entries = input_end - input_begin;
+
+    for (std::size_t i = threadIdx.x; i < output_entries;
+         i += blockDim.x) {
+      stage_out[i] = Entry{kEmpty, 0};
+    }
+    if (threadIdx.x == 0) {
+      mbarrier_init(&barrier);
+    }
+    __syncthreads();
+
+    if (input_entries != 0) {
+      if (threadIdx.x == 0) {
+        const int input_bytes =
+            static_cast<int>(input_entries * sizeof(Entry));
+        mbarrier_arrive_expect_tx(&barrier, input_bytes);
+        bulk_g2s(stage_in, segment_in + input_begin, input_bytes, &barrier);
+      }
+      mbarrier_wait(&barrier, 0);
+    }
+    __syncthreads();
+
+    for (std::size_t local = threadIdx.x; local < input_entries;
+         local += blockDim.x) {
+      const std::size_t live_index = input_begin + local;
+      const std::size_t destination =
+          redistributed_position(live_index, capacity, live_count);
+      stage_out[destination - output_begin] = stage_in[local];
+    }
+
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const int output_bytes =
+          static_cast<int>(output_entries * sizeof(Entry));
+      bulk_s2g(segment_out + output_begin, stage_out, output_bytes);
+      asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+      asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+    }
+    __syncthreads();
+  }
+#endif
+}
+
+// Two-stage producer/consumer pipeline. Thread 0 owns TMA issue and publication;
+// the other seven warps cooperatively clear and redistribute a ready tile.
+// While consumers work on tile n, the producer can store tile n-1 and keep the
+// load for tile n+1 in flight.
+__global__ void redistribute_tma_pipeline_kernel(
+    const Entry* input, Entry* output, std::size_t capacity,
+    std::size_t live_count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  extern __shared__ __align__(16) unsigned char storage[];
+  Entry* entries = reinterpret_cast<Entry*>(storage);
+  constexpr std::size_t kStageEntries = 2 * kTileEntries;
+  const Entry* segment_in = input + std::size_t(blockIdx.x) * capacity;
+  Entry* segment_out = output + std::size_t(blockIdx.x) * capacity;
+  __shared__ __align__(8) std::uint64_t load_barrier[2];
+  __shared__ int compute_ready[2];
+  __shared__ std::size_t input_begin[2];
+  __shared__ std::size_t input_entries[2];
+  __shared__ std::size_t output_begin[2];
+  __shared__ std::size_t output_entries[2];
+
+  if (threadIdx.x == 0) {
+    mbarrier_init(&load_barrier[0]);
+    mbarrier_init(&load_barrier[1]);
+    compute_ready[0] = 0;
+    compute_ready[1] = 0;
+  }
+  __syncthreads();
+
+  const std::size_t tile_count = ceil_div(capacity, kTileEntries);
+  if (threadIdx.x == 0) {
+    const std::size_t preload = tile_count < 2 ? tile_count : 2;
+    for (std::size_t tile = 0; tile < preload; ++tile) {
+      const int stage = static_cast<int>(tile & 1);
+      const std::size_t begin = tile * kTileEntries;
+      const std::size_t end = min(capacity, begin + kTileEntries);
+      output_begin[stage] = begin;
+      output_entries[stage] = end - begin;
+      input_begin[stage] = ceil_div(begin * live_count, capacity);
+      const std::size_t input_end =
+          min(live_count, ceil_div(end * live_count, capacity));
+      input_entries[stage] = input_end - input_begin[stage];
+      __threadfence_block();
+      const int bytes =
+          static_cast<int>(input_entries[stage] * sizeof(Entry));
+      mbarrier_arrive_expect_tx(&load_barrier[stage], bytes);
+      if (bytes != 0) {
+        bulk_g2s(entries + stage * kStageEntries,
+                 segment_in + input_begin[stage], bytes,
+                 &load_barrier[stage]);
+      }
+    }
+
+    for (std::size_t tile = 0; tile < tile_count; ++tile) {
+      const int stage = static_cast<int>(tile & 1);
+      while (atomicAdd(&compute_ready[stage], 0) <
+             static_cast<int>(tile + 1)) {
+        __nanosleep(64);
+      }
+
+      Entry* stage_out =
+          entries + stage * kStageEntries + kTileEntries;
+      const int bytes =
+          static_cast<int>(output_entries[stage] * sizeof(Entry));
+      bulk_s2g(segment_out + output_begin[stage], stage_out, bytes);
+      asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+      asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+
+      const std::size_t next_tile = tile + 2;
+      if (next_tile < tile_count) {
+        const std::size_t begin = next_tile * kTileEntries;
+        const std::size_t end = min(capacity, begin + kTileEntries);
+        output_begin[stage] = begin;
+        output_entries[stage] = end - begin;
+        input_begin[stage] = ceil_div(begin * live_count, capacity);
+        const std::size_t input_end =
+            min(live_count, ceil_div(end * live_count, capacity));
+        input_entries[stage] = input_end - input_begin[stage];
+        __threadfence_block();
+        const int input_bytes =
+            static_cast<int>(input_entries[stage] * sizeof(Entry));
+        mbarrier_arrive_expect_tx(&load_barrier[stage], input_bytes);
+        if (input_bytes != 0) {
+          bulk_g2s(entries + stage * kStageEntries,
+                   segment_in + input_begin[stage], input_bytes,
+                   &load_barrier[stage]);
+        }
+      }
+    }
+  } else if (threadIdx.x >= kProducerThreads) {
+    const int consumer_id = threadIdx.x - kProducerThreads;
+    for (std::size_t tile = 0; tile < tile_count; ++tile) {
+      const int stage = static_cast<int>(tile & 1);
+      const int phase = static_cast<int>((tile / 2) & 1);
+      mbarrier_wait(&load_barrier[stage], phase);
+
+      Entry* stage_in = entries + stage * kStageEntries;
+      Entry* stage_out = stage_in + kTileEntries;
+      const std::size_t out_count = output_entries[stage];
+      for (std::size_t i = consumer_id; i < out_count;
+           i += kConsumerThreads) {
+        stage_out[i] = Entry{kEmpty, 0};
+      }
+      consumer_barrier();
+
+      const std::size_t in_begin = input_begin[stage];
+      const std::size_t in_count = input_entries[stage];
+      const std::size_t out_begin = output_begin[stage];
+      for (std::size_t local = consumer_id; local < in_count;
+           local += kConsumerThreads) {
+        const std::size_t live_index = in_begin + local;
+        const std::size_t destination =
+            redistributed_position(live_index, capacity, live_count);
+        stage_out[destination - out_begin] = stage_in[local];
+      }
+      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+      consumer_barrier();
+      if (threadIdx.x == kProducerThreads) {
+        atomicExch(&compute_ready[stage], static_cast<int>(tile + 1));
+      }
+    }
+  }
+#endif
+}
+
 Options parse_options(int argc, char** argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
@@ -243,7 +445,7 @@ Options parse_options(int argc, char** argv) {
     } else if (!std::strcmp(argv[i], "--help")) {
       std::puts("segment_bench [--segment-bytes N] [--density F] "
                 "[--working-set-mb N] [--warmup N] [--iterations N] "
-                "[--mode all|scalar|cp_async|tma]");
+                "[--mode all|scalar|cp_async|tma|tma_tiled|tma_pipeline]");
       std::exit(0);
     } else {
       throw std::runtime_error(std::string("unknown argument: ") + argv[i]);
@@ -298,6 +500,72 @@ float time_mode(const Entry* input, Entry* output, int segments,
   return elapsed_ms / iterations;
 }
 
+float time_tma_tiled_mode(const Entry* input, Entry* output, int segments,
+                          std::size_t capacity, std::size_t live_count,
+                          int warmup, int iterations) {
+  constexpr std::size_t smem_bytes = 2 * kMaxBulkBytes;
+  CUDA_CHECK(cudaFuncSetAttribute(
+      redistribute_tma_tiled_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_bytes)));
+  for (int i = 0; i < warmup; ++i) {
+    redistribute_tma_tiled_kernel<<<segments, kThreads, smem_bytes>>>(
+        input, output, capacity, live_count);
+  }
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  cudaEvent_t start{};
+  cudaEvent_t stop{};
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventRecord(start));
+  for (int i = 0; i < iterations; ++i) {
+    redistribute_tma_tiled_kernel<<<segments, kThreads, smem_bytes>>>(
+        input, output, capacity, live_count);
+  }
+  CUDA_CHECK(cudaEventRecord(stop));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  float elapsed_ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+  return elapsed_ms / iterations;
+}
+
+float time_tma_pipeline_mode(const Entry* input, Entry* output, int segments,
+                             std::size_t capacity, std::size_t live_count,
+                             int warmup, int iterations) {
+  constexpr std::size_t smem_bytes = 4 * kMaxBulkBytes;
+  CUDA_CHECK(cudaFuncSetAttribute(
+      redistribute_tma_pipeline_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_bytes)));
+  for (int i = 0; i < warmup; ++i) {
+    redistribute_tma_pipeline_kernel<<<segments, kThreads, smem_bytes>>>(
+        input, output, capacity, live_count);
+  }
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  cudaEvent_t start{};
+  cudaEvent_t stop{};
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventRecord(start));
+  for (int i = 0; i < iterations; ++i) {
+    redistribute_tma_pipeline_kernel<<<segments, kThreads, smem_bytes>>>(
+        input, output, capacity, live_count);
+  }
+  CUDA_CHECK(cudaEventRecord(stop));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  float elapsed_ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+  return elapsed_ms / iterations;
+}
+
 bool validate_first_segment(const Entry* output, std::size_t capacity,
                             std::size_t live_count) {
   std::vector<Entry> host(capacity);
@@ -328,6 +596,10 @@ const char* mode_name(Mode mode) {
       return "cp_async";
     case Mode::kTma:
       return "tma_bulk";
+    case Mode::kTmaTiled:
+      return "tma_tiled";
+    case Mode::kTmaPipeline:
+      return "tma_pipeline";
   }
   return "unknown";
 }
@@ -372,7 +644,8 @@ int main(int argc, char** argv) {
 
     std::puts("device,cc,mode,segment_bytes,density,segments,live_entries,"
               "latency_ms,effective_gbps,valid");
-    const Mode modes[] = {Mode::kScalar, Mode::kCpAsync, Mode::kTma};
+    const Mode modes[] = {Mode::kScalar, Mode::kCpAsync, Mode::kTma,
+                          Mode::kTmaTiled, Mode::kTmaPipeline};
     for (Mode mode : modes) {
       if (!requested(options, mode)) {
         continue;
@@ -380,7 +653,9 @@ int main(int argc, char** argv) {
       if (mode == Mode::kCpAsync && prop.major < 8) {
         continue;
       }
-      if (mode == Mode::kTma && prop.major < 9) {
+      if ((mode == Mode::kTma || mode == Mode::kTmaTiled ||
+           mode == Mode::kTmaPipeline) &&
+          prop.major < 9) {
         if (options.mode != "all") {
           throw std::runtime_error("TMA mode requires compute capability 9.x");
         }
@@ -396,10 +671,18 @@ int main(int argc, char** argv) {
         latency_ms = time_mode<Mode::kCpAsync>(
             input, output, segments, capacity, live_count, smem_bytes,
             options.warmup, options.iterations);
-      } else {
+      } else if (mode == Mode::kTma) {
         latency_ms = time_mode<Mode::kTma>(
             input, output, segments, capacity, live_count, smem_bytes,
             options.warmup, options.iterations);
+      } else if (mode == Mode::kTmaTiled) {
+        latency_ms = time_tma_tiled_mode(
+            input, output, segments, capacity, live_count, options.warmup,
+            options.iterations);
+      } else {
+        latency_ms = time_tma_pipeline_mode(
+            input, output, segments, capacity, live_count, options.warmup,
+            options.iterations);
       }
       const bool valid = validate_first_segment(output, capacity, live_count);
       const double bytes = 2.0 * segments * options.segment_bytes;
