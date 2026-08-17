@@ -1,0 +1,8 @@
+/build/
+/results/
+/data/
+*.csv
+*.nsys-rep
+*.ncu-rep
+__pycache__/
+

@@ -1,0 +1,39 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fbf4c52..409652b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -35,6 +35,8 @@ set(GENCODE_SM71
+   -gencode=arch=compute_71,code=sm_71 -gencode=arch=compute_71,code=compute_71)
+ set(GENCODE_SM75
+ -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_75,code=compute_75)
++set(GENCODE_SM90
++  -gencode=arch=compute_90,code=sm_90)
+ 
+ option(SLABHASH_GENCODE_SM30 "GENCODE_SM30" OFF)
+ option(SLABHASH_GENCODE_SM35 "GENCODE_SM35" ON)
+@@ -46,5 +48,6 @@ option(SLABHASH_GENCODE_SM70 "GENCODE_SM70" OFF)
+ option(SLABHASH_GENCODE_SM71 "GENCODE_SM71" OFF)
+ option(SLABHASH_GENCODE_SM75 "GENCODE_SM75" OFF)
++option(SLABHASH_GENCODE_SM90 "GENCODE_SM90" OFF)
+ 
+ if (SLABHASH_GENCODE_SM30)
+   set(GENCODE ${GENCODE} ${GENCODE_SM30})
+@@ -82,6 +85,10 @@ if(SLABHASH_GENCODE_SM75)
+   set(GENCODE ${GENCODE} ${GENCODE_SM75})
+ endif(SLABHASH_GENCODE_SM75)
+ 
++if(SLABHASH_GENCODE_SM90)
++  set(GENCODE ${GENCODE} ${GENCODE_SM90})
++endif(SLABHASH_GENCODE_SM90)
++
+ include_directories(SlabAlloc/src)
+ include_directories(src src/concurrent)
+ include_directories(ThirdParty/rapidjson/include)
+@@ -88,5 +95,7 @@ include_directories(ThirdParty/rapidjson/include)
+ include_directories(ThirdParty/googletest/googletest)
+ include_directories(ThirdParty/googletest/googletest/include)
++if (DGTEST)
+ add_subdirectory(ThirdParty/googletest/googletest)
+ add_subdirectory(test)
++endif()
+ add_subdirectory(bench)

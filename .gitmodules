@@ -1,0 +1,6 @@
+[submodule "third_party/LPMA"]
+	path = third_party/LPMA
+	url = https://github.com/pkumod/LPMA.git
+[submodule "third_party/SlabHash"]
+	path = third_party/SlabHash
+	url = https://github.com/owensgroup/SlabHash.git
