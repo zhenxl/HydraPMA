@@ -1,0 +1,10 @@
+{
+  "segment_bytes": [4096, 8192, 16384, 32768, 65536, 98304],
+  "densities": [0.5, 0.7, 0.9],
+  "layouts": ["prefix", "spread"],
+  "mode": "gap_all",
+  "working_set_mb": 64,
+  "warmup": 5,
+  "iterations": 20,
+  "repetitions": 5
+}

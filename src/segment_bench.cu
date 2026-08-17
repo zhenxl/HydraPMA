@@ -35,7 +35,19 @@ constexpr int kConsumerThreads = kThreads - kProducerThreads;
     }                                                                            \
   } while (0)
 
-enum class Mode { kScalar, kCpAsync, kTma, kTmaTiled, kTmaPipeline };
+enum class Mode {
+  kScalar,
+  kCpAsync,
+  kTma,
+  kTmaTiled,
+  kTmaPipeline,
+  kGapScan,
+  kGapTmaPipeline,
+  kGapTmaChunked,
+  kGapTmaBuffered
+};
+
+enum class Layout { kPrefix, kSpread };
 
 struct Options {
   std::size_t segment_bytes = 4096;
@@ -44,6 +56,7 @@ struct Options {
   int warmup = 5;
   int iterations = 20;
   std::string mode = "all";
+  std::string layout = "prefix";
 };
 
 __device__ __forceinline__ std::uint32_t smem_address(const void* ptr) {
@@ -140,12 +153,28 @@ __host__ __device__ __forceinline__ std::size_t ceil_div(
 __global__ void initialize_input(Entry* input, Entry* output,
                                  std::size_t total_entries,
                                  std::size_t capacity,
-                                 std::size_t live_count) {
+                                 std::size_t live_count, Layout layout) {
   for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
        i < total_entries; i += std::size_t(gridDim.x) * blockDim.x) {
     const std::size_t local = i % capacity;
-    input[i] = local < live_count ? Entry{i + 1, (i + 1) ^ 0x5a5a5a5aULL}
-                                  : Entry{kEmpty, 0};
+    std::size_t live_index = live_count;
+    if (layout == Layout::kPrefix) {
+      if (local < live_count) {
+        live_index = local;
+      }
+    } else {
+      const std::size_t candidate = ceil_div(local * live_count, capacity);
+      if (candidate < live_count &&
+          redistributed_position(candidate, capacity, live_count) == local) {
+        live_index = candidate;
+      }
+    }
+    if (live_index < live_count) {
+      const std::uint64_t key = live_index + 1;
+      input[i] = Entry{key, key ^ 0x5a5a5a5aULL};
+    } else {
+      input[i] = Entry{kEmpty, 0};
+    }
     output[i] = Entry{kEmpty, 0};
   }
 }
@@ -421,6 +450,275 @@ __global__ void redistribute_tma_pipeline_kernel(
 #endif
 }
 
+// Arbitrary-gap baseline. A CTA clears one output segment, scans the input in
+// 256-entry batches, and uses warp ballots plus an eight-warp prefix to assign
+// stable live ranks. Unlike the compact-prefix kernels above, every input slot
+// is examined and the scan cost is included in the timed region.
+__global__ void redistribute_gap_scan_kernel(const Entry* input, Entry* output,
+                                             std::size_t capacity,
+                                             std::size_t live_count) {
+  const Entry* segment_in = input + std::size_t(blockIdx.x) * capacity;
+  Entry* segment_out = output + std::size_t(blockIdx.x) * capacity;
+  __shared__ int warp_counts[8];
+  __shared__ int warp_offsets[8];
+  __shared__ int batch_total;
+
+  for (std::size_t i = threadIdx.x; i < capacity; i += blockDim.x) {
+    segment_out[i] = Entry{kEmpty, 0};
+  }
+  __syncthreads();
+
+  std::size_t live_base = 0;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  for (std::size_t begin = 0; begin < capacity; begin += kThreads) {
+    const std::size_t index = begin + threadIdx.x;
+    const Entry entry =
+        index < capacity ? segment_in[index] : Entry{kEmpty, 0};
+    const bool valid = index < capacity && entry.key != kEmpty;
+    const unsigned mask = __ballot_sync(0xffffffffu, valid);
+    if (lane == 0) {
+      warp_counts[warp] = __popc(mask);
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+      if (lane < 8) {
+        int offset = 0;
+        for (int i = 0; i < lane; ++i) {
+          offset += warp_counts[i];
+        }
+        warp_offsets[lane] = offset;
+      }
+      if (lane == 0) {
+        int total = 0;
+        for (int i = 0; i < 8; ++i) {
+          total += warp_counts[i];
+        }
+        batch_total = total;
+      }
+    }
+    __syncthreads();
+
+    if (valid) {
+      const unsigned lower_mask =
+          lane == 0 ? 0u : ((1u << lane) - 1u);
+      const std::size_t rank =
+          live_base + warp_offsets[warp] + __popc(mask & lower_mask);
+      const std::size_t destination =
+          redistributed_position(rank, capacity, live_count);
+      segment_out[destination] = entry;
+    }
+    __syncthreads();
+    live_base += batch_total;
+  }
+}
+
+// Hopper arbitrary-gap path. The producer warp owns two alternating 16 KiB TMA
+// input stages. Seven consumer warps perform a stable ballot compaction and
+// scatter live entries directly to their PMA destinations. Output clearing and
+// full-capacity gap scanning are intentionally part of the measurement.
+template <int strategy>
+__global__ void redistribute_gap_tma_pipeline_kernel(
+    const Entry* input, Entry* output, std::size_t capacity,
+    std::size_t live_count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  extern __shared__ __align__(16) unsigned char storage[];
+  Entry* entries = reinterpret_cast<Entry*>(storage);
+  Entry* compact = entries + 2 * kTileEntries;
+  const Entry* segment_in = input + std::size_t(blockIdx.x) * capacity;
+  Entry* segment_out = output + std::size_t(blockIdx.x) * capacity;
+  __shared__ __align__(8) std::uint64_t load_barrier[2];
+  __shared__ int scan_ready[2];
+  __shared__ std::size_t input_entries[2];
+  __shared__ int warp_counts[7];
+  __shared__ int warp_offsets[7];
+  __shared__ int batch_total;
+
+  if (threadIdx.x == 0) {
+    mbarrier_init(&load_barrier[0]);
+    mbarrier_init(&load_barrier[1]);
+    scan_ready[0] = 0;
+    scan_ready[1] = 0;
+  }
+  for (std::size_t i = threadIdx.x; i < capacity; i += blockDim.x) {
+    segment_out[i] = Entry{kEmpty, 0};
+  }
+  __syncthreads();
+
+  const std::size_t tile_count = ceil_div(capacity, kTileEntries);
+  if (threadIdx.x == 0) {
+    const std::size_t preload = tile_count < 2 ? tile_count : 2;
+    for (std::size_t tile = 0; tile < preload; ++tile) {
+      const int stage = static_cast<int>(tile & 1);
+      const std::size_t begin = tile * kTileEntries;
+      input_entries[stage] = min(capacity - begin, kTileEntries);
+      __threadfence_block();
+      const int bytes =
+          static_cast<int>(input_entries[stage] * sizeof(Entry));
+      mbarrier_arrive_expect_tx(&load_barrier[stage], bytes);
+      bulk_g2s(entries + stage * kTileEntries, segment_in + begin, bytes,
+               &load_barrier[stage]);
+    }
+
+    for (std::size_t tile = 0; tile < tile_count; ++tile) {
+      const int stage = static_cast<int>(tile & 1);
+      while (atomicAdd(&scan_ready[stage], 0) <
+             static_cast<int>(tile + 1)) {
+        __nanosleep(64);
+      }
+
+      const std::size_t next_tile = tile + 2;
+      if (next_tile < tile_count) {
+        const std::size_t begin = next_tile * kTileEntries;
+        input_entries[stage] = min(capacity - begin, kTileEntries);
+        __threadfence_block();
+        const int bytes =
+            static_cast<int>(input_entries[stage] * sizeof(Entry));
+        mbarrier_arrive_expect_tx(&load_barrier[stage], bytes);
+        bulk_g2s(entries + stage * kTileEntries, segment_in + begin, bytes,
+                 &load_barrier[stage]);
+      }
+    }
+  } else if (threadIdx.x >= kProducerThreads) {
+    const int consumer_id = threadIdx.x - kProducerThreads;
+    const int lane = consumer_id & 31;
+    const int consumer_warp = consumer_id >> 5;
+    std::size_t live_base = 0;
+
+    for (std::size_t tile = 0; tile < tile_count; ++tile) {
+      const int stage = static_cast<int>(tile & 1);
+      const int phase = static_cast<int>((tile / 2) & 1);
+      mbarrier_wait(&load_barrier[stage], phase);
+      Entry* stage_in = entries + stage * kTileEntries;
+      const std::size_t in_count = input_entries[stage];
+
+      if constexpr (strategy == 0) {
+        for (std::size_t begin = 0; begin < in_count;
+             begin += kConsumerThreads) {
+          const std::size_t local = begin + consumer_id;
+          const Entry entry =
+              local < in_count ? stage_in[local] : Entry{kEmpty, 0};
+          const bool valid = local < in_count && entry.key != kEmpty;
+          const unsigned mask = __ballot_sync(0xffffffffu, valid);
+          if (lane == 0) {
+            warp_counts[consumer_warp] = __popc(mask);
+          }
+          consumer_barrier();
+
+          if (consumer_warp == 0) {
+            if (lane < 7) {
+              int offset = 0;
+              for (int i = 0; i < lane; ++i) {
+                offset += warp_counts[i];
+              }
+              warp_offsets[lane] = offset;
+            }
+            if (lane == 0) {
+              int total = 0;
+              for (int i = 0; i < 7; ++i) {
+                total += warp_counts[i];
+              }
+              batch_total = total;
+            }
+          }
+          consumer_barrier();
+
+          if (valid) {
+            const unsigned lower_mask =
+                lane == 0 ? 0u : ((1u << lane) - 1u);
+            const std::size_t rank =
+                live_base + warp_offsets[consumer_warp] +
+                __popc(mask & lower_mask);
+            const std::size_t destination =
+                redistributed_position(rank, capacity, live_count);
+            segment_out[destination] = entry;
+          }
+          consumer_barrier();
+          live_base += batch_total;
+        }
+      } else {
+        // Give each consumer a contiguous slice. A thread counts at most five
+        // entries for a full 16 KiB tile, then one warp/CTA scan assigns the
+        // stable base rank for the entire slice.
+        const std::size_t chunk_begin =
+            (std::size_t(consumer_id) * in_count) / kConsumerThreads;
+        const std::size_t chunk_end =
+            (std::size_t(consumer_id + 1) * in_count) / kConsumerThreads;
+        int thread_live = 0;
+        for (std::size_t local = chunk_begin; local < chunk_end; ++local) {
+          thread_live += stage_in[local].key != kEmpty;
+        }
+
+        int inclusive = thread_live;
+        for (int offset = 1; offset < 32; offset <<= 1) {
+          const int other =
+              __shfl_up_sync(0xffffffffu, inclusive, offset);
+          if (lane >= offset) {
+            inclusive += other;
+          }
+        }
+        if (lane == 31) {
+          warp_counts[consumer_warp] = inclusive;
+        }
+        consumer_barrier();
+
+        if (consumer_warp == 0) {
+          if (lane < 7) {
+            int offset = 0;
+            for (int i = 0; i < lane; ++i) {
+              offset += warp_counts[i];
+            }
+            warp_offsets[lane] = offset;
+          }
+          if (lane == 0) {
+            int total = 0;
+            for (int i = 0; i < 7; ++i) {
+              total += warp_counts[i];
+            }
+            batch_total = total;
+          }
+        }
+        consumer_barrier();
+
+        std::size_t rank =
+            live_base + warp_offsets[consumer_warp] +
+            inclusive - thread_live;
+        for (std::size_t local = chunk_begin; local < chunk_end; ++local) {
+          const Entry entry = stage_in[local];
+          if (entry.key != kEmpty) {
+            if constexpr (strategy == 1) {
+              const std::size_t destination =
+                  redistributed_position(rank, capacity, live_count);
+              segment_out[destination] = entry;
+            } else {
+              compact[rank - live_base] = entry;
+            }
+            ++rank;
+          }
+        }
+        consumer_barrier();
+        if constexpr (strategy == 2) {
+          for (std::size_t local = consumer_id; local < batch_total;
+               local += kConsumerThreads) {
+            const std::size_t rank = live_base + local;
+            const std::size_t destination =
+                redistributed_position(rank, capacity, live_count);
+            segment_out[destination] = compact[local];
+          }
+          consumer_barrier();
+        }
+        live_base += batch_total;
+      }
+
+      if (threadIdx.x == kProducerThreads) {
+        atomicExch(&scan_ready[stage], static_cast<int>(tile + 1));
+      }
+    }
+  }
+#endif
+}
+
 Options parse_options(int argc, char** argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
@@ -442,10 +740,15 @@ Options parse_options(int argc, char** argv) {
       options.iterations = std::stoi(value(argv[i]));
     } else if (!std::strcmp(argv[i], "--mode")) {
       options.mode = value(argv[i]);
+    } else if (!std::strcmp(argv[i], "--layout")) {
+      options.layout = value(argv[i]);
     } else if (!std::strcmp(argv[i], "--help")) {
       std::puts("segment_bench [--segment-bytes N] [--density F] "
                 "[--working-set-mb N] [--warmup N] [--iterations N] "
-                "[--mode all|scalar|cp_async|tma|tma_tiled|tma_pipeline]");
+                "[--layout prefix|spread] "
+                "[--mode all|scalar|cp_async|tma|tma_tiled|tma_pipeline|"
+                "gap_all|gap_scan|gap_tma_pipeline|gap_tma_chunked|"
+                "gap_tma_buffered]");
       std::exit(0);
     } else {
       throw std::runtime_error(std::string("unknown argument: ") + argv[i]);
@@ -459,6 +762,18 @@ Options parse_options(int argc, char** argv) {
   }
   if (options.iterations <= 0 || options.warmup < 0) {
     throw std::runtime_error("invalid iteration count");
+  }
+  if (options.layout != "prefix" && options.layout != "spread") {
+    throw std::runtime_error("layout must be prefix or spread");
+  }
+  const bool gap_mode = options.mode == "gap_all" ||
+                        options.mode == "gap_scan" ||
+                        options.mode == "gap_tma_pipeline" ||
+                        options.mode == "gap_tma_chunked" ||
+                        options.mode == "gap_tma_buffered";
+  if (options.layout != "prefix" && !gap_mode) {
+    throw std::runtime_error(
+        "non-prefix layouts require gap_all, gap_scan, or gap_tma_pipeline");
   }
   return options;
 }
@@ -566,6 +881,72 @@ float time_tma_pipeline_mode(const Entry* input, Entry* output, int segments,
   return elapsed_ms / iterations;
 }
 
+float time_gap_scan_mode(const Entry* input, Entry* output, int segments,
+                         std::size_t capacity, std::size_t live_count,
+                         int warmup, int iterations) {
+  for (int i = 0; i < warmup; ++i) {
+    redistribute_gap_scan_kernel<<<segments, kThreads>>>(
+        input, output, capacity, live_count);
+  }
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  cudaEvent_t start{};
+  cudaEvent_t stop{};
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventRecord(start));
+  for (int i = 0; i < iterations; ++i) {
+    redistribute_gap_scan_kernel<<<segments, kThreads>>>(
+        input, output, capacity, live_count);
+  }
+  CUDA_CHECK(cudaEventRecord(stop));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  float elapsed_ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+  return elapsed_ms / iterations;
+}
+
+template <int strategy>
+float time_gap_tma_pipeline_mode(const Entry* input, Entry* output,
+                                 int segments, std::size_t capacity,
+                                 std::size_t live_count, int warmup,
+                                 int iterations) {
+  constexpr std::size_t smem_bytes =
+      (strategy == 2 ? 3 : 2) * kMaxBulkBytes;
+  CUDA_CHECK(cudaFuncSetAttribute(
+      redistribute_gap_tma_pipeline_kernel<strategy>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_bytes)));
+  for (int i = 0; i < warmup; ++i) {
+    redistribute_gap_tma_pipeline_kernel<strategy>
+        <<<segments, kThreads, smem_bytes>>>(
+        input, output, capacity, live_count);
+  }
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  cudaEvent_t start{};
+  cudaEvent_t stop{};
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventRecord(start));
+  for (int i = 0; i < iterations; ++i) {
+    redistribute_gap_tma_pipeline_kernel<strategy>
+        <<<segments, kThreads, smem_bytes>>>(
+        input, output, capacity, live_count);
+  }
+  CUDA_CHECK(cudaEventRecord(stop));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  float elapsed_ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+  return elapsed_ms / iterations;
+}
+
 bool validate_first_segment(const Entry* output, std::size_t capacity,
                             std::size_t live_count) {
   std::vector<Entry> host(capacity);
@@ -600,13 +981,31 @@ const char* mode_name(Mode mode) {
       return "tma_tiled";
     case Mode::kTmaPipeline:
       return "tma_pipeline";
+    case Mode::kGapScan:
+      return "gap_scan";
+    case Mode::kGapTmaPipeline:
+      return "gap_tma_pipeline";
+    case Mode::kGapTmaChunked:
+      return "gap_tma_chunked";
+    case Mode::kGapTmaBuffered:
+      return "gap_tma_buffered";
   }
   return "unknown";
 }
 
 bool requested(const Options& options, Mode mode) {
-  return options.mode == "all" || options.mode == mode_name(mode) ||
+  const bool gap = mode == Mode::kGapScan ||
+                   mode == Mode::kGapTmaPipeline ||
+                   mode == Mode::kGapTmaChunked ||
+                   mode == Mode::kGapTmaBuffered;
+  return (options.mode == "all" && !gap) ||
+         (options.mode == "gap_all" && gap) ||
+         options.mode == mode_name(mode) ||
          (mode == Mode::kTma && options.mode == "tma");
+}
+
+Layout input_layout(const Options& options) {
+  return options.layout == "spread" ? Layout::kSpread : Layout::kPrefix;
 }
 
 }  // namespace
@@ -628,7 +1027,12 @@ int main(int argc, char** argv) {
     const std::size_t total_entries = std::size_t(segments) * capacity;
     const std::size_t smem_bytes = 2 * options.segment_bytes;
 
-    if (smem_bytes > prop.sharedMemPerBlockOptin) {
+    const bool needs_full_segment_smem =
+        options.mode == "all" || options.mode == "scalar" ||
+        options.mode == "cp_async" || options.mode == "tma" ||
+        options.mode == "tma_bulk";
+    if (needs_full_segment_smem &&
+        smem_bytes > prop.sharedMemPerBlockOptin) {
       throw std::runtime_error("requested two-buffer shared memory exceeds "
                                "device opt-in limit");
     }
@@ -638,14 +1042,17 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&input, total_entries * sizeof(Entry)));
     CUDA_CHECK(cudaMalloc(&output, total_entries * sizeof(Entry)));
     initialize_input<<<std::min<int>(65535, (total_entries + 255) / 256), 256>>>(
-        input, output, total_entries, capacity, live_count);
+        input, output, total_entries, capacity, live_count,
+        input_layout(options));
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    std::puts("device,cc,mode,segment_bytes,density,segments,live_entries,"
-              "latency_ms,effective_gbps,valid");
+    std::puts("device,cc,mode,layout,segment_bytes,density,segments,"
+              "live_entries,latency_ms,effective_gbps,valid");
     const Mode modes[] = {Mode::kScalar, Mode::kCpAsync, Mode::kTma,
-                          Mode::kTmaTiled, Mode::kTmaPipeline};
+                          Mode::kTmaTiled, Mode::kTmaPipeline,
+                          Mode::kGapScan, Mode::kGapTmaPipeline,
+                          Mode::kGapTmaChunked, Mode::kGapTmaBuffered};
     for (Mode mode : modes) {
       if (!requested(options, mode)) {
         continue;
@@ -654,7 +1061,10 @@ int main(int argc, char** argv) {
         continue;
       }
       if ((mode == Mode::kTma || mode == Mode::kTmaTiled ||
-           mode == Mode::kTmaPipeline) &&
+           mode == Mode::kTmaPipeline ||
+           mode == Mode::kGapTmaPipeline ||
+           mode == Mode::kGapTmaChunked ||
+           mode == Mode::kGapTmaBuffered) &&
           prop.major < 9) {
         if (options.mode != "all") {
           throw std::runtime_error("TMA mode requires compute capability 9.x");
@@ -679,18 +1089,35 @@ int main(int argc, char** argv) {
         latency_ms = time_tma_tiled_mode(
             input, output, segments, capacity, live_count, options.warmup,
             options.iterations);
-      } else {
+      } else if (mode == Mode::kTmaPipeline) {
         latency_ms = time_tma_pipeline_mode(
+            input, output, segments, capacity, live_count, options.warmup,
+            options.iterations);
+      } else if (mode == Mode::kGapScan) {
+        latency_ms = time_gap_scan_mode(
+            input, output, segments, capacity, live_count, options.warmup,
+            options.iterations);
+      } else if (mode == Mode::kGapTmaPipeline) {
+        latency_ms = time_gap_tma_pipeline_mode<0>(
+            input, output, segments, capacity, live_count, options.warmup,
+            options.iterations);
+      } else if (mode == Mode::kGapTmaChunked) {
+        latency_ms = time_gap_tma_pipeline_mode<1>(
+            input, output, segments, capacity, live_count, options.warmup,
+            options.iterations);
+      } else {
+        latency_ms = time_gap_tma_pipeline_mode<2>(
             input, output, segments, capacity, live_count, options.warmup,
             options.iterations);
       }
       const bool valid = validate_first_segment(output, capacity, live_count);
       const double bytes = 2.0 * segments * options.segment_bytes;
       const double gbps = bytes / (latency_ms * 1.0e6);
-      std::printf("\"%s\",%d.%d,%s,%zu,%.4f,%d,%zu,%.6f,%.3f,%d\n",
+      std::printf("\"%s\",%d.%d,%s,%s,%zu,%.4f,%d,%zu,%.6f,%.3f,%d\n",
                   prop.name, prop.major, prop.minor, mode_name(mode),
-                  options.segment_bytes, options.density, segments, live_count,
-                  latency_ms, gbps, valid ? 1 : 0);
+                  options.layout.c_str(), options.segment_bytes,
+                  options.density, segments, live_count, latency_ms, gbps,
+                  valid ? 1 : 0);
       if (!valid) {
         throw std::runtime_error(std::string("validation failed for ") +
                                  mode_name(mode));

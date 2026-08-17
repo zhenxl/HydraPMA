@@ -55,6 +55,30 @@ The benchmark now preserves five ablation modes: `scalar`, `cp_async`,
 `tma_pipeline`. On H20, the pipeline is intended for 64 KiB and larger
 segments; smaller segments retain the lighter paths.
 
+Those five modes intentionally model the compact live-prefix phase after an
+update planner has found the live entries. Arbitrary PMA gaps are measured
+separately so their scan cost cannot be hidden:
+
+```bash
+./build/segment_bench --segment-bytes 65536 --density 0.7 \
+  --layout spread --mode gap_all
+
+python3 scripts/run_segment_sweep.py \
+  --binary ./build/segment_bench \
+  --config configs/h20_gap_sweep.json \
+  --output results/h20_gap_sweep.csv
+```
+
+`gap_all` preserves four arbitrary-gap ablations. `gap_scan` uses direct
+global loads and a stable CTA prefix scan. `gap_tma_pipeline` assigns a
+producer warp to double-buffered 16 KiB TMA loads while seven consumer warps
+compact and scatter live entries. `gap_tma_chunked` reduces barriers but
+intentionally exposes the loss from strided stores. `gap_tma_buffered` adds a
+shared compact tile to recover coalesced rank-order scatter. All four paths
+clear the output and examine the full input segment inside the timed kernel;
+`prefix` and evenly gapped `spread` layouts must produce the same ordered
+result.
+
 The benchmark emits measured data only.  It exits instead of silently labeling
 a non-Hopper path as TMA when `sm_90a` support is absent.
 

@@ -25,6 +25,7 @@ def main() -> int:
         "device",
         "cc",
         "mode",
+        "layout",
         "segment_bytes",
         "density",
         "segments",
@@ -40,33 +41,37 @@ def main() -> int:
         for repetition in range(config["repetitions"]):
             for segment_bytes in config["segment_bytes"]:
                 for density in config["densities"]:
-                    command = [
-                        str(args.binary),
-                        "--segment-bytes",
-                        str(segment_bytes),
-                        "--density",
-                        str(density),
-                        "--working-set-mb",
-                        str(config["working_set_mb"]),
-                        "--warmup",
-                        str(config["warmup"]),
-                        "--iterations",
-                        str(config["iterations"]),
-                    ]
-                    print(" ".join(command), file=sys.stderr, flush=True)
-                    completed = subprocess.run(
-                        command, check=True, text=True, capture_output=True
-                    )
-                    rows = list(csv.DictReader(completed.stdout.splitlines()))
-                    if not rows:
-                        raise RuntimeError(f"no measurements from: {command}")
-                    for row in rows:
-                        row["repetition"] = repetition
-                        writer.writerow(row)
-                    output_file.flush()
+                    for layout in config.get("layouts", ["prefix"]):
+                        command = [
+                            str(args.binary),
+                            "--segment-bytes",
+                            str(segment_bytes),
+                            "--density",
+                            str(density),
+                            "--working-set-mb",
+                            str(config["working_set_mb"]),
+                            "--warmup",
+                            str(config["warmup"]),
+                            "--iterations",
+                            str(config["iterations"]),
+                            "--layout",
+                            layout,
+                            "--mode",
+                            config.get("mode", "all"),
+                        ]
+                        print(" ".join(command), file=sys.stderr, flush=True)
+                        completed = subprocess.run(
+                            command, check=True, text=True, capture_output=True
+                        )
+                        rows = list(csv.DictReader(completed.stdout.splitlines()))
+                        if not rows:
+                            raise RuntimeError(f"no measurements from: {command}")
+                        for row in rows:
+                            row["repetition"] = repetition
+                            writer.writerow(row)
+                        output_file.flush()
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

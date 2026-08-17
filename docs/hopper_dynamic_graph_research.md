@@ -167,9 +167,60 @@ Density 0.75，working set 16 MiB。NCU duration 只用于 counter 对比，不�
 
 1. 根据 density 缩小每个 stage 的 input buffer，避免固定保留完整 16 KiB input tile。
 2. 用 persistent CTA work queue 摊薄每 segment block 的启动和尾部 wave。
-3. 将 batch planner、gap scan 和 live compaction 接入同一流水，验证非 compact input。
+3. 将已验证的 gap scan/live compaction 接到 batch planner 和真实 update segment。
 4. 对混合 segment size 实现 device-side adaptive dispatcher。
 5. 集成真实 insert/delete batch 后重新运行 Nsight Systems，确认 allocation/memset/copy 不再主导。
+
+### 1.8 任意 gap scan：同步与写合并必须同时优化
+
+1.7 的结果只覆盖 compact live prefix。为了把真实 PMA 中 gap discovery 和 stable compaction 的成本纳入计时，benchmark 新增两种输入：
+
+- `prefix`：live entries 连续位于 segment 前部，用于和旧 primitive 对照。
+- `spread`：live entries 按目标 density 均匀散布，保持 key 顺序但在整个 segment 中存在 gap。
+
+任意 gap 实验保留四条独立路径：
+
+- `gap_scan`：direct global load、CTA stable prefix scan、rank-order scatter。
+- `gap_tma_pipeline`：一个 producer warp 双缓冲 16 KiB TMA load；7 个 consumer warps 每 224 entries 做 ballot scan。
+- `gap_tma_chunked`：每个 consumer 处理连续小 chunk，将每 tile 的 consumer barrier 从约 15 次降为 3 次，但直接按 thread-owned rank scatter。
+- `gap_tma_buffered`：chunk scan 后先写 shared compact tile，再由连续 consumer lanes 按 rank scatter；使用 48 KiB dynamic shared memory。
+
+最终严格 sweep 使用 64 MiB working set、5 次进程级重复、5 次 warmup 和 20 次 measured iteration；6 个 segment size、3 个 density、2 个 layout、4 个 mode 共 720 条记录，全部通过 correctness。下面是 `spread`、density 0.7 的中位数：
+
+| Segment | Direct scan | Raw TMA pipeline | Chunked direct scatter | Buffered chunk scan | Buffered vs scan | Buffered vs raw TMA |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 KiB | 70.54 us | 103.19 us | 123.83 us | 138.34 us | 0.51x | 0.75x |
+| 8 KiB | 66.27 us | 75.22 us | 80.98 us | 91.50 us | 0.72x | 0.82x |
+| 16 KiB | 66.39 us | 63.00 us | 68.89 us | 71.17 us | 0.93x | 0.89x |
+| 32 KiB | 71.40 us | 63.02 us | 70.07 us | 65.16 us | 1.10x | 0.97x |
+| 64 KiB | 93.93 us | 84.58 us | 96.81 us | 69.59 us | 1.35x | 1.22x |
+| 96 KiB | 101.40 us | 94.45 us | 127.73 us | 86.29 us | 1.18x | 1.09x |
+
+64 KiB、density 0.7、`spread` 的 NCU 对照解释了收益来源：
+
+| 路径 | Duration | SM peak | DRAM peak | Long scoreboard | Barrier stall | Excessive L2 sectors | Dynamic SMEM |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Direct scan | 28.06 us | 25.36% | 15.91% | 9.17 | 5.76 | 150,784 | 0 KiB |
+| Raw TMA pipeline | 26.56 us | 31.85% | 17.32% | 3.50 | 5.04 | 150,784 | 32 KiB |
+| Chunked direct scatter | 25.41 us | 27.34% | 18.05% | 4.42 | 1.83 | 357,632 | 32 KiB |
+| Buffered chunk scan | 23.10 us | 30.82% | 19.96% | 4.17 | 2.23 | 163,328 | 48 KiB |
+
+这个 ablation 给出两个关键结论：
+
+1. TMA 主要通过集中加载降低 dependent global-load latency；raw pipeline 将 long scoreboard 从 9.17 降到 3.50，但仍受频繁 consumer barrier 限制。
+2. 只减少 barrier 会失败。unbuffered chunked 将 barrier stall 从 5.04 降到 1.83，却把 excessive sectors 提高到 2.37 倍；在 L2-resident 小工作集上看似更快，在 64 MiB 严格 sweep 中反而明显变慢。shared compact buffer 同时保留低同步和 rank-order 合并写，才形成稳定收益。
+
+当前只应视为候选 dispatcher，而不是硬编码结论：
+
+```text
+< 16 KiB:               gap_scan
+16-32 KiB:              gap_tma_pipeline
+64 KiB:                 gap_tma_buffered
+96 KiB, density <= 0.7: gap_tma_buffered
+96 KiB, high density:   gap_tma_pipeline
+```
+
+在加入 48/80 KiB、更多 density、混合 segment wave 和真实 insert/delete batch 前，不应把这些阈值当成最终策略。任意 gap modes 会扫描完整 input、清空完整 output，并额外 scatter `live_count` 个 entry；CSV 的 `effective_gbps` 仍是逻辑 redistribution 口径，路径比较应以 latency 和 NCU 实际 traffic 为主。
 
 ## 2. 从 Profiling 推导出的研究问题
 

@@ -49,3 +49,16 @@ for segment_bytes in 65536 98304; do
       --working-set-mb 16 --warmup 0 --iterations 1 --mode "${mode}"
   done
 done
+
+for segment_bytes in 32768 65536; do
+  for mode in gap_scan gap_tma_pipeline gap_tma_chunked gap_tma_buffered; do
+    CUDA_VISIBLE_DEVICES="${profile_gpu}" "${ncu_bin}" \
+      --set full --kernel-name-base demangled \
+      --kernel-name 'regex:redistribute_gap' --launch-count 1 \
+      --force-overwrite \
+      -o "${result_dir}/segment_${segment_bytes}_${mode}_spread_ncu" \
+      "${segment_bin}" --segment-bytes "${segment_bytes}" --density 0.7 \
+      --layout spread --working-set-mb 16 --warmup 0 --iterations 1 \
+      --mode "${mode}"
+  done
+done
