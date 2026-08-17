@@ -84,4 +84,6 @@ a non-Hopper path as TMA when `sm_90a` support is absent.
 
 See `docs/h20_initial_results.md` for the first H20 measurements and Nsight
 diagnosis, `docs/hopper_dynamic_graph_research.md` for the CPU-to-Hopper research
-roadmap, and `docs/experiment_plan.md` for the original experiment plan.
+roadmap, `docs/hydrapma_ideas_technical_update.md` for the consolidated
+baseline ideas, kernel details, and current progress, and
+`docs/experiment_plan.md` for the original experiment plan.
