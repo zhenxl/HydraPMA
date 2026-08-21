@@ -174,3 +174,22 @@ duty cycle, and the relevant NCU stall/traffic metrics.
 4. `Add versioned delta rollover and COW publication`
 5. `Integrate Hopper compaction and concurrent query validation`
 6. `Profile adaptive lock-free updates on H20`
+
+## Implementation status: 2026-08-21
+
+Completed and compiled for CUDA 12.9 / `sm_90a`:
+
+- `09bb60c`: one-level GPU preprocessing, insert/delete merge, PMA
+  redistribution, and independent CPU reference;
+- `2059ed9`: parallel effect-prefix merge and GPU serial/parallel adaptive
+  bucketing;
+- `4c39899`: per-edge versus warp-aggregated delta reservation, READY
+  publication, generation-tagged handles, CAS rollover, and exactly-once chain
+  validation;
+- `67e433e`: immutable replacement descriptors, versioned COW publication,
+  and concurrent snapshot validation.
+
+The GitHub CUDA container verifies compilation only. Runtime correctness,
+throughput, crossover thresholds, CAS retry behavior, and profiler counters
+still require the H20 experiment matrices. No end-to-end speedup claim should
+be made from CI.

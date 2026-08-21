@@ -1,0 +1,19 @@
+{
+  "repetitions": 5,
+  "cases": [
+    {
+      "name": "descriptor_rate",
+      "segments": [64, 256, 1024],
+      "capacities": [64, 256],
+      "epochs": [8, 32, 128],
+      "query_blocks": 0
+    },
+    {
+      "name": "large_replacement",
+      "segments": [64, 256],
+      "capacities": [1024, 4096],
+      "epochs": [8, 32],
+      "query_blocks": 0
+    }
+  ]
+}

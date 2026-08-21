@@ -143,6 +143,19 @@ when the active handle is unchanged across traversal; the benchmark reports
 handle-change retries and treats any accepted partial-generation snapshot as a
 correctness failure.
 
+```bash
+python3 scripts/run_publication_sweep.py \
+  --binary ./build/publication_bench \
+  --config configs/h20_publication_sweep.json \
+  --output results/h20_publication_sweep.csv
+```
+
+Profile the end-to-end, lock-free, and publication paths with:
+
+```bash
+bash scripts/profile_dynamic_h20.sh
+```
+
 See `docs/h20_initial_results.md` for the first H20 measurements and Nsight
 diagnosis, `docs/hopper_dynamic_graph_research.md` for the CPU-to-Hopper research
 roadmap, `docs/hydrapma_ideas_technical_update.md` for the consolidated
