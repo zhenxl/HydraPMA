@@ -87,13 +87,18 @@ The first end-to-end one-level update baseline is:
 ```bash
 ./build/update_bench --vertices 4096 --segment-capacity 256 \
   --density 0.5 --batch-size 65536 --insert-ratio 0.5 \
-  --duplicate-ratio 0.1 --distribution uniform
+  --duplicate-ratio 0.1 --distribution uniform \
+  --mode adaptive --parallel-threshold 1024
 ```
 
 It sorts and resolves conflicting updates on the GPU, builds affected-segment
 offsets, merges insertions/deletions into gapped segments, and compares every
 result with an independent CPU last-write-wins reference. Its phase-serial
-per-segment merge is the correctness baseline for adaptive and lock-free paths.
+per-segment merge is retained as the small-task baseline. The parallel path
+compacts the gapped base with a CTA scan, computes an exclusive prefix of each
+update's net degree effect, and scatters base/update entries directly to unique
+final ranks. Adaptive mode buckets segments on the GPU using
+`segment_capacity + update_count`.
 
 Run the initial semantics matrix with:
 

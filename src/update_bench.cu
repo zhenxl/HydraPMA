@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <cub/block/block_scan.cuh>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
@@ -58,6 +59,8 @@ struct Options {
   double insert_ratio = 0.5;
   double duplicate_ratio = 0.1;
   std::string distribution = "uniform";
+  std::string mode = "adaptive";
+  unsigned int parallel_threshold = 1024;
   double zipf_skew = 1.1;
   std::uint64_t seed = 7;
   int warmup = 3;
@@ -236,15 +239,28 @@ __global__ void count_updates_kernel(const Update* updates,
   }
 }
 
-__global__ void collect_affected_kernel(const unsigned int* segment_counts,
-                                        unsigned int vertices,
-                                        unsigned int* affected_segments,
-                                        unsigned int* affected_count) {
+__global__ void plan_segments_kernel(
+    const unsigned int* segment_counts, unsigned int vertices,
+    unsigned int capacity, unsigned int parallel_threshold, int mode,
+    unsigned int* serial_segments, unsigned int* parallel_segments,
+    unsigned int* affected_count, unsigned int* serial_count,
+    unsigned int* parallel_count) {
   for (unsigned int src = blockIdx.x * blockDim.x + threadIdx.x;
        src < vertices; src += gridDim.x * blockDim.x) {
     if (segment_counts[src] != 0) {
-      const unsigned int slot = atomicAdd(affected_count, 1U);
-      affected_segments[slot] = src;
+      atomicAdd(affected_count, 1U);
+      const bool use_parallel =
+          mode == 1 ||
+          (mode == 2 &&
+           std::uint64_t{capacity} + segment_counts[src] >=
+               parallel_threshold);
+      if (use_parallel) {
+        const unsigned int slot = atomicAdd(parallel_count, 1U);
+        parallel_segments[slot] = src;
+      } else {
+        const unsigned int slot = atomicAdd(serial_count, 1U);
+        serial_segments[slot] = src;
+      }
     }
   }
 }
@@ -333,6 +349,179 @@ __global__ void merge_one_level_kernel(
   }
 }
 
+__device__ __forceinline__ unsigned int lower_bound_entries(
+    const Entry* entries, unsigned int count, std::uint64_t key) {
+  unsigned int first = 0;
+  while (first < count) {
+    const unsigned int middle = first + (count - first) / 2;
+    if (entries[middle].key < key) {
+      first = middle + 1;
+    } else {
+      count = middle;
+    }
+  }
+  return first;
+}
+
+__device__ __forceinline__ unsigned int lower_bound_updates(
+    const Update* updates, unsigned int first, unsigned int last,
+    std::uint64_t key) {
+  while (first < last) {
+    const unsigned int middle = first + (last - first) / 2;
+    if (updates[middle].dst < key) {
+      first = middle + 1;
+    } else {
+      last = middle;
+    }
+  }
+  return first;
+}
+
+__global__ void prepare_parallel_merge_kernel(
+    const Entry* base, Entry* dense_base, unsigned int* live_counts,
+    unsigned int* base_counts, const Update* updates,
+    const unsigned int* update_offsets,
+    const unsigned int* parallel_segments, unsigned int capacity,
+    int* update_prefix, int* segment_effects, unsigned int* overflow) {
+  using BlockScan = cub::BlockScan<int, kThreads>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ int carry;
+  __shared__ unsigned int dense_count;
+
+  const unsigned int src = parallel_segments[blockIdx.x];
+  const Entry* base_segment = base + std::size_t{src} * capacity;
+  Entry* dense_segment = dense_base + std::size_t{src} * capacity;
+
+  if (threadIdx.x == 0) {
+    carry = 0;
+  }
+  __syncthreads();
+  for (unsigned int tile = 0; tile < capacity; tile += blockDim.x) {
+    const unsigned int index = tile + threadIdx.x;
+    const int live =
+        index < capacity && base_segment[index].key != kEmpty ? 1 : 0;
+    int prefix = 0;
+    int tile_total = 0;
+    const int tile_base = carry;
+    BlockScan(scan_storage).ExclusiveSum(live, prefix, tile_total);
+    if (live) {
+      dense_segment[tile_base + prefix] = base_segment[index];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      carry += tile_total;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    dense_count = static_cast<unsigned int>(carry);
+    base_counts[src] = dense_count;
+    carry = 0;
+  }
+  __syncthreads();
+
+  const unsigned int update_begin = update_offsets[src];
+  const unsigned int update_end = update_offsets[src + 1];
+  for (unsigned int tile = update_begin; tile < update_end;
+       tile += blockDim.x) {
+    const unsigned int update_index = tile + threadIdx.x;
+    int effect = 0;
+    if (update_index < update_end) {
+      const Update update = updates[update_index];
+      const unsigned int base_position = lower_bound_entries(
+          dense_segment, dense_count, update.dst);
+      const bool present =
+          base_position < dense_count &&
+          dense_segment[base_position].key == update.dst;
+      effect = update.op == kInsert ? (present ? 0 : 1)
+                                    : (present ? -1 : 0);
+    }
+    int prefix = 0;
+    int tile_total = 0;
+    const int tile_base = carry;
+    BlockScan(scan_storage).ExclusiveSum(effect, prefix, tile_total);
+    if (update_index < update_end) {
+      update_prefix[update_index] = tile_base + prefix;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      carry += tile_total;
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    segment_effects[src] = carry;
+    const int result_count = static_cast<int>(dense_count) + carry;
+    const bool did_overflow =
+        result_count < 0 || result_count > static_cast<int>(capacity);
+    overflow[src] = did_overflow ? 1U : 0U;
+    live_counts[src] = did_overflow
+                           ? 0U
+                           : static_cast<unsigned int>(result_count);
+  }
+}
+
+__global__ void scatter_parallel_merge_kernel(
+    const Entry* dense_base, Entry* output, const unsigned int* live_counts,
+    const unsigned int* base_counts, const Update* updates,
+    const unsigned int* update_offsets,
+    const unsigned int* parallel_segments, unsigned int capacity,
+    const int* update_prefix, const int* segment_effects,
+    const unsigned int* overflow) {
+  const unsigned int src = parallel_segments[blockIdx.x];
+  Entry* output_segment = output + std::size_t{src} * capacity;
+  const Entry* dense_segment =
+      dense_base + std::size_t{src} * capacity;
+  const unsigned int result_count = live_counts[src];
+  const unsigned int dense_count = base_counts[src];
+  const unsigned int update_begin = update_offsets[src];
+  const unsigned int update_end = update_offsets[src + 1];
+
+  for (unsigned int i = threadIdx.x; i < capacity; i += blockDim.x) {
+    output_segment[i] = Entry{kEmpty, 0};
+  }
+  __syncthreads();
+  if (overflow[src] != 0 || result_count == 0) {
+    return;
+  }
+
+  for (unsigned int base_index = threadIdx.x; base_index < dense_count;
+       base_index += blockDim.x) {
+    const Entry entry = dense_segment[base_index];
+    const unsigned int update_position = lower_bound_updates(
+        updates, update_begin, update_end, entry.key);
+    const bool overridden =
+        update_position < update_end &&
+        updates[update_position].dst == entry.key;
+    if (!overridden) {
+      const int delta_before =
+          update_position < update_end
+              ? update_prefix[update_position]
+              : segment_effects[src];
+      const int rank = static_cast<int>(base_index) + delta_before;
+      const std::size_t destination = redistributed_position(
+          static_cast<unsigned int>(rank), capacity, result_count);
+      output_segment[destination] = entry;
+    }
+  }
+
+  for (unsigned int update_index = update_begin + threadIdx.x;
+       update_index < update_end; update_index += blockDim.x) {
+    const Update update = updates[update_index];
+    if (update.op != kInsert) {
+      continue;
+    }
+    const unsigned int base_position = lower_bound_entries(
+        dense_segment, dense_count, update.dst);
+    const int rank =
+        static_cast<int>(base_position) + update_prefix[update_index];
+    const std::size_t destination = redistributed_position(
+        static_cast<unsigned int>(rank), capacity, result_count);
+    output_segment[destination] = Entry{update.dst, update.value};
+  }
+}
+
 float elapsed_ms(cudaEvent_t start, cudaEvent_t stop) {
   CUDA_CHECK(cudaEventRecord(stop));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -364,6 +553,10 @@ Options parse_options(int argc, char** argv) {
       options.duplicate_ratio = std::stod(value(argv[i]));
     } else if (!std::strcmp(argv[i], "--distribution")) {
       options.distribution = value(argv[i]);
+    } else if (!std::strcmp(argv[i], "--mode")) {
+      options.mode = value(argv[i]);
+    } else if (!std::strcmp(argv[i], "--parallel-threshold")) {
+      options.parallel_threshold = std::stoul(value(argv[i]));
     } else if (!std::strcmp(argv[i], "--zipf-skew")) {
       options.zipf_skew = std::stod(value(argv[i]));
     } else if (!std::strcmp(argv[i], "--seed")) {
@@ -377,6 +570,7 @@ Options parse_options(int argc, char** argv) {
           "update_bench [--vertices N] [--segment-capacity N] "
           "[--density F] [--batch-size N] [--insert-ratio F] "
           "[--duplicate-ratio F] [--distribution uniform|zipf] "
+          "[--mode serial|parallel|adaptive] [--parallel-threshold N] "
           "[--zipf-skew F] [--seed N] [--warmup N] [--iterations N]");
       std::exit(0);
     } else {
@@ -400,6 +594,13 @@ Options parse_options(int argc, char** argv) {
   if (options.distribution != "uniform" &&
       options.distribution != "zipf") {
     throw std::runtime_error("distribution must be uniform or zipf");
+  }
+  if (options.mode != "serial" && options.mode != "parallel" &&
+      options.mode != "adaptive") {
+    throw std::runtime_error("mode must be serial, parallel, or adaptive");
+  }
+  if (options.parallel_threshold == 0) {
+    throw std::runtime_error("parallel threshold must be nonzero");
   }
   if (options.zipf_skew <= 0.0 || options.warmup < 0 ||
       options.iterations <= 0) {
@@ -479,11 +680,17 @@ int run_benchmark(const Options& options) {
       options.vertices + 1, 0);
   thrust::device_vector<unsigned int> d_update_offsets(
       options.vertices + 1, 0);
-  thrust::device_vector<unsigned int> d_affected(options.vertices);
+  thrust::device_vector<unsigned int> d_serial_segments(options.vertices);
+  thrust::device_vector<unsigned int> d_parallel_segments(options.vertices);
   thrust::device_vector<unsigned int> d_affected_count(1, 0);
+  thrust::device_vector<unsigned int> d_serial_count(1, 0);
+  thrust::device_vector<unsigned int> d_parallel_count(1, 0);
   thrust::device_vector<unsigned int> d_live_counts(
       options.vertices, initial_live);
+  thrust::device_vector<unsigned int> d_base_counts(options.vertices, 0);
   thrust::device_vector<unsigned int> d_overflow(options.vertices, 0);
+  thrust::device_vector<int> d_update_prefix(updates.size(), 0);
+  thrust::device_vector<int> d_segment_effects(options.vertices, 0);
 
   cudaEvent_t start{};
   cudaEvent_t stop{};
@@ -507,19 +714,36 @@ int run_benchmark(const Options& options) {
 
   const int vertex_blocks = static_cast<int>(std::min<std::size_t>(
       65535, (std::size_t{options.vertices} + kThreads - 1) / kThreads));
-  collect_affected_kernel<<<std::max(1, vertex_blocks), kThreads>>>(
+  const int path_mode =
+      options.mode == "serial" ? 0 : (options.mode == "parallel" ? 1 : 2);
+  plan_segments_kernel<<<std::max(1, vertex_blocks), kThreads>>>(
       thrust::raw_pointer_cast(d_segment_counts.data()), options.vertices,
-      thrust::raw_pointer_cast(d_affected.data()),
-      thrust::raw_pointer_cast(d_affected_count.data()));
+      options.segment_capacity, options.parallel_threshold, path_mode,
+      thrust::raw_pointer_cast(d_serial_segments.data()),
+      thrust::raw_pointer_cast(d_parallel_segments.data()),
+      thrust::raw_pointer_cast(d_affected_count.data()),
+      thrust::raw_pointer_cast(d_serial_count.data()),
+      thrust::raw_pointer_cast(d_parallel_count.data()));
   CUDA_CHECK(cudaGetLastError());
   const float preprocess_ms = elapsed_ms(start, stop);
 
   unsigned int affected_count = 0;
+  unsigned int serial_count = 0;
+  unsigned int parallel_count = 0;
   CUDA_CHECK(cudaMemcpy(
       &affected_count, thrust::raw_pointer_cast(d_affected_count.data()),
       sizeof(affected_count), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(
+      &serial_count, thrust::raw_pointer_cast(d_serial_count.data()),
+      sizeof(serial_count), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(
+      &parallel_count, thrust::raw_pointer_cast(d_parallel_count.data()),
+      sizeof(parallel_count), cudaMemcpyDeviceToHost));
   if (affected_count == 0) {
     throw std::runtime_error("generated batch contains no affected segment");
+  }
+  if (serial_count + parallel_count != affected_count) {
+    throw std::runtime_error("planner bucket counts are inconsistent");
   }
 
   CUDA_CHECK(cudaMemcpy(
@@ -528,16 +752,44 @@ int run_benchmark(const Options& options) {
       total_entries * sizeof(Entry), cudaMemcpyDeviceToDevice));
 
   auto launch_update = [&]() {
-    merge_one_level_kernel<<<affected_count, kThreads>>>(
-        thrust::raw_pointer_cast(d_base.data()),
-        thrust::raw_pointer_cast(d_output.data()),
-        thrust::raw_pointer_cast(d_scratch.data()),
-        thrust::raw_pointer_cast(d_live_counts.data()),
-        thrust::raw_pointer_cast(d_updates.data()),
-        thrust::raw_pointer_cast(d_update_offsets.data()),
-        thrust::raw_pointer_cast(d_affected.data()),
-        options.segment_capacity,
-        thrust::raw_pointer_cast(d_overflow.data()));
+    if (serial_count != 0) {
+      merge_one_level_kernel<<<serial_count, kThreads>>>(
+          thrust::raw_pointer_cast(d_base.data()),
+          thrust::raw_pointer_cast(d_output.data()),
+          thrust::raw_pointer_cast(d_scratch.data()),
+          thrust::raw_pointer_cast(d_live_counts.data()),
+          thrust::raw_pointer_cast(d_updates.data()),
+          thrust::raw_pointer_cast(d_update_offsets.data()),
+          thrust::raw_pointer_cast(d_serial_segments.data()),
+          options.segment_capacity,
+          thrust::raw_pointer_cast(d_overflow.data()));
+    }
+    if (parallel_count != 0) {
+      prepare_parallel_merge_kernel<<<parallel_count, kThreads>>>(
+          thrust::raw_pointer_cast(d_base.data()),
+          thrust::raw_pointer_cast(d_scratch.data()),
+          thrust::raw_pointer_cast(d_live_counts.data()),
+          thrust::raw_pointer_cast(d_base_counts.data()),
+          thrust::raw_pointer_cast(d_updates.data()),
+          thrust::raw_pointer_cast(d_update_offsets.data()),
+          thrust::raw_pointer_cast(d_parallel_segments.data()),
+          options.segment_capacity,
+          thrust::raw_pointer_cast(d_update_prefix.data()),
+          thrust::raw_pointer_cast(d_segment_effects.data()),
+          thrust::raw_pointer_cast(d_overflow.data()));
+      scatter_parallel_merge_kernel<<<parallel_count, kThreads>>>(
+          thrust::raw_pointer_cast(d_scratch.data()),
+          thrust::raw_pointer_cast(d_output.data()),
+          thrust::raw_pointer_cast(d_live_counts.data()),
+          thrust::raw_pointer_cast(d_base_counts.data()),
+          thrust::raw_pointer_cast(d_updates.data()),
+          thrust::raw_pointer_cast(d_update_offsets.data()),
+          thrust::raw_pointer_cast(d_parallel_segments.data()),
+          options.segment_capacity,
+          thrust::raw_pointer_cast(d_update_prefix.data()),
+          thrust::raw_pointer_cast(d_segment_effects.data()),
+          thrust::raw_pointer_cast(d_overflow.data()));
+    }
   };
 
   for (int iteration = 0; iteration < options.warmup; ++iteration) {
@@ -581,15 +833,17 @@ int run_benchmark(const Options& options) {
   std::fprintf(stderr, "# gpu=%s initial_live=%u\n",
                properties.name, initial_live);
   std::puts(
-      "benchmark,vertices,segment_capacity,density,input_updates,"
+      "benchmark,mode,parallel_threshold,serial_segments,parallel_segments,"
+      "vertices,segment_capacity,density,input_updates,"
       "unique_updates,affected_segments,distribution,insert_ratio,"
       "duplicate_ratio,preprocess_ms,update_ms,update_mups,"
       "approx_bytes_per_update,overflow_segments,correct");
   std::printf(
-      "one_level_serial,%u,%u,%.4f,%zu,%zu,%u,%s,%.4f,%.4f,"
+      "one_level,%s,%u,%u,%u,%u,%u,%.4f,%zu,%zu,%u,%s,%.4f,%.4f,"
       "%.6f,%.6f,%.6f,%.2f,%u,%s\n",
-      options.vertices, options.segment_capacity, options.density,
-      options.batch_size, unique_updates, affected_count,
+      options.mode.c_str(), options.parallel_threshold, serial_count,
+      parallel_count, options.vertices, options.segment_capacity,
+      options.density, options.batch_size, unique_updates, affected_count,
       options.distribution.c_str(), options.insert_ratio,
       options.duplicate_ratio, preprocess_ms, update_ms, update_mups,
       approximate_bytes_per_update, overflow_segments,

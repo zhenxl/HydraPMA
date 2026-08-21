@@ -14,6 +14,10 @@ import sys
 
 BINARY_FIELDS = [
     "benchmark",
+    "mode",
+    "parallel_threshold",
+    "serial_segments",
+    "parallel_segments",
     "vertices",
     "segment_capacity",
     "density",
@@ -86,6 +90,9 @@ def main() -> int:
                         "--insert-ratio", str(insert_ratio),
                         "--duplicate-ratio", str(duplicate_ratio),
                         "--distribution", distribution,
+                        "--mode", case.get("mode", "adaptive"),
+                        "--parallel-threshold",
+                        str(case.get("parallel_threshold", 1024)),
                         "--zipf-skew", str(case.get("zipf_skew", 1.1)),
                         "--seed", str(seed),
                         "--warmup", str(config["warmup"]),
