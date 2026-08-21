@@ -1,0 +1,27 @@
+{
+  "base_seed": 31,
+  "warmup": 3,
+  "iterations": 10,
+  "repetitions": 5,
+  "cases": [
+    {
+      "name": "uniform_locality",
+      "vertices": 1024,
+      "block_capacities": [32, 64, 128],
+      "batch_sizes": [1024, 10000, 100000],
+      "input_orders": ["grouped", "random"],
+      "distributions": ["uniform"],
+      "pool_factor": 8
+    },
+    {
+      "name": "zipf_contention",
+      "vertices": 1024,
+      "block_capacities": [32, 64],
+      "batch_sizes": [10000, 100000],
+      "input_orders": ["grouped", "random"],
+      "distributions": ["zipf"],
+      "zipf_skew": 1.1,
+      "pool_factor": 16
+    }
+  ]
+}

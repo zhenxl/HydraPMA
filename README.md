@@ -122,6 +122,13 @@ word. A full block is sealed by installing a fresh block with CAS; losing CAS
 allocations are not reused in this milestone. Validation walks every generation
 chain and requires every input sequence to appear exactly once.
 
+```bash
+python3 scripts/run_lockfree_sweep.py \
+  --binary ./build/lockfree_delta_bench \
+  --config configs/h20_lockfree_delta_sweep.json \
+  --output results/h20_lockfree_delta_sweep.csv
+```
+
 See `docs/h20_initial_results.md` for the first H20 measurements and Nsight
 diagnosis, `docs/hopper_dynamic_graph_research.md` for the CPU-to-Hopper research
 roadmap, `docs/hydrapma_ideas_technical_update.md` for the consolidated
