@@ -11,7 +11,7 @@
       "batch_sizes": [1024, 10000, 100000],
       "input_orders": ["grouped", "random"],
       "distributions": ["uniform"],
-      "pool_factor": 8
+      "pool_factor": 64
     },
     {
       "name": "zipf_contention",
@@ -21,7 +21,7 @@
       "input_orders": ["grouped", "random"],
       "distributions": ["zipf"],
       "zipf_skew": 1.1,
-      "pool_factor": 16
+      "pool_factor": 256
     }
   ]
 }

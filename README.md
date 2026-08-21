@@ -141,7 +141,8 @@ Replacement bases and descriptors are immutable. A publisher fences the fully
 built replacement before a versioned-handle CAS. Readers accept a snapshot only
 when the active handle is unchanged across traversal; the benchmark reports
 handle-change retries and treats any accepted partial-generation snapshot as a
-correctness failure.
+correctness failure. One finite reader kernel is submitted per epoch so the
+test does not depend on cross-stream forward progress for a persistent kernel.
 
 ```bash
 python3 scripts/run_publication_sweep.py \
@@ -155,6 +156,9 @@ Profile the end-to-end, lock-free, and publication paths with:
 ```bash
 bash scripts/profile_dynamic_h20.sh
 ```
+
+Use `BUILD_DIR`, `NSYS_BIN`, and `NCU_BIN` when the native `sm_90a`
+build or CUDA 12.9 Nsight tools are outside the defaults.
 
 See `docs/h20_initial_results.md` for the first H20 measurements and Nsight
 diagnosis, `docs/hopper_dynamic_graph_research.md` for the CPU-to-Hopper research

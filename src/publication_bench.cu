@@ -86,12 +86,8 @@ class DeviceBuffer {
 __global__ void build_and_publish_kernel(
     SegmentDesc* descriptors, std::uint64_t* bases,
     unsigned long long* active_handles, unsigned int segments,
-    unsigned int capacity, unsigned int epoch, unsigned int* query_started,
+    unsigned int capacity, unsigned int epoch,
     unsigned long long* cas_failures) {
-  if (epoch != 0) {
-    while (atomicAdd(query_started, 0U) == 0U) {
-    }
-  }
   const unsigned int segment = blockIdx.x;
   const unsigned int descriptor_index = epoch * segments + segment;
   const std::uint64_t base_offset =
@@ -128,75 +124,44 @@ __global__ void build_and_publish_kernel(
 __global__ void query_snapshots_kernel(
     const SegmentDesc* descriptors, const std::uint64_t* bases,
     unsigned long long* active_handles, unsigned int segments,
-    unsigned int* query_started, unsigned int* publication_done,
     QueryCounters* counters) {
   __shared__ unsigned long long first_handle;
   __shared__ SegmentDesc descriptor;
   __shared__ unsigned int mismatch;
-  __shared__ unsigned int stop;
-  __shared__ unsigned int done_seen;
 
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    atomicExch(query_started, 1U);
-  }
-  if (threadIdx.x == 0) {
-    done_seen = 0;
-  }
-  __syncthreads();
-
-  while (true) {
-    for (unsigned int segment = blockIdx.x; segment < segments;
-         segment += gridDim.x) {
-      if (threadIdx.x == 0) {
-        first_handle =
-            atomicCAS(active_handles + segment, 0ULL, 0ULL);
-        descriptor = descriptors[handle_index(first_handle)];
-        mismatch = 0;
-      }
-      __syncthreads();
-
-      for (unsigned int index = threadIdx.x; index < descriptor.count;
-           index += blockDim.x) {
-        const std::uint64_t actual =
-            bases[descriptor.base_offset + index];
-        if (actual != expected_value(segment, descriptor.generation, index)) {
-          atomicExch(&mismatch, 1U);
-        }
-      }
-      __syncthreads();
-
-      if (threadIdx.x == 0) {
-        const unsigned long long second_handle =
-            atomicCAS(active_handles + segment, 0ULL, 0ULL);
-        if (first_handle == second_handle) {
-          atomicAdd(&counters->accepted, 1ULL);
-          if (mismatch != 0) {
-            atomicAdd(&counters->mismatches, 1ULL);
-          }
-        } else {
-          atomicAdd(&counters->retries, 1ULL);
-        }
-      }
-      __syncthreads();
-    }
+  for (unsigned int segment = blockIdx.x; segment < segments;
+       segment += gridDim.x) {
     if (threadIdx.x == 0) {
-      if (done_seen != 0) {
-        stop = 1;
-      } else {
-        done_seen = atomicAdd(publication_done, 0U);
-        stop = 0;
+      first_handle =
+          atomicCAS(active_handles + segment, 0ULL, 0ULL);
+      descriptor = descriptors[handle_index(first_handle)];
+      mismatch = 0;
+    }
+    __syncthreads();
+
+    for (unsigned int index = threadIdx.x; index < descriptor.count;
+         index += blockDim.x) {
+      const std::uint64_t actual =
+          bases[descriptor.base_offset + index];
+      if (actual != expected_value(segment, descriptor.generation, index)) {
+        atomicExch(&mismatch, 1U);
       }
     }
     __syncthreads();
-    if (stop != 0) {
-      break;
-    }
-  }
-}
 
-__global__ void mark_done_kernel(unsigned int* publication_done) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    atomicExch(publication_done, 1U);
+    if (threadIdx.x == 0) {
+      const unsigned long long second_handle =
+          atomicCAS(active_handles + segment, 0ULL, 0ULL);
+      if (first_handle == second_handle) {
+        atomicAdd(&counters->accepted, 1ULL);
+        if (mismatch != 0) {
+          atomicAdd(&counters->mismatches, 1ULL);
+        }
+      } else {
+        atomicAdd(&counters->retries, 1ULL);
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -261,8 +226,6 @@ int run_benchmark(const Options& options) {
   DeviceBuffer<SegmentDesc> descriptors(descriptor_count);
   DeviceBuffer<std::uint64_t> bases(base_entries);
   DeviceBuffer<unsigned long long> active_handles(options.segments);
-  DeviceBuffer<unsigned int> query_started(1);
-  DeviceBuffer<unsigned int> publication_done(1);
   DeviceBuffer<QueryCounters> query_counters(1);
   DeviceBuffer<unsigned long long> cas_failures(1);
 
@@ -275,8 +238,14 @@ int run_benchmark(const Options& options) {
                    : std::min(options.query_blocks, safe_query_blocks));
   cudaStream_t query_stream{};
   cudaStream_t publisher_stream{};
-  CUDA_CHECK(cudaStreamCreate(&query_stream));
-  CUDA_CHECK(cudaStreamCreate(&publisher_stream));
+  int least_priority = 0;
+  int greatest_priority = 0;
+  CUDA_CHECK(cudaDeviceGetStreamPriorityRange(
+      &least_priority, &greatest_priority));
+  CUDA_CHECK(cudaStreamCreateWithPriority(
+      &query_stream, cudaStreamNonBlocking, greatest_priority));
+  CUDA_CHECK(cudaStreamCreateWithPriority(
+      &publisher_stream, cudaStreamNonBlocking, least_priority));
   cudaEvent_t start{};
   cudaEvent_t stop{};
   CUDA_CHECK(cudaEventCreate(&start));
@@ -290,9 +259,6 @@ int run_benchmark(const Options& options) {
     CUDA_CHECK(cudaMemset(active_handles.data(), 0,
                           active_handles.size() *
                               sizeof(unsigned long long)));
-    CUDA_CHECK(cudaMemset(query_started.data(), 0, sizeof(unsigned int)));
-    CUDA_CHECK(cudaMemset(publication_done.data(), 0,
-                          sizeof(unsigned int)));
     CUDA_CHECK(cudaMemset(query_counters.data(), 0,
                           sizeof(QueryCounters)));
     CUDA_CHECK(cudaMemset(cas_failures.data(), 0,
@@ -300,25 +266,21 @@ int run_benchmark(const Options& options) {
 
     build_and_publish_kernel<<<options.segments, kThreads>>>(
         descriptors.data(), bases.data(), active_handles.data(),
-        options.segments, options.capacity, 0, query_started.data(),
-        cas_failures.data());
+        options.segments, options.capacity, 0, cas_failures.data());
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    query_snapshots_kernel<<<query_blocks, kThreads, 0, query_stream>>>(
-        descriptors.data(), bases.data(), active_handles.data(),
-        options.segments, query_started.data(), publication_done.data(),
-        query_counters.data());
     CUDA_CHECK(cudaEventRecord(start, publisher_stream));
     for (unsigned int epoch = 1; epoch <= options.epochs; ++epoch) {
       build_and_publish_kernel<<<options.segments, kThreads, 0,
                                  publisher_stream>>>(
           descriptors.data(), bases.data(), active_handles.data(),
           options.segments, options.capacity, epoch,
-          query_started.data(), cas_failures.data());
+          cas_failures.data());
+      query_snapshots_kernel<<<query_blocks, kThreads, 0, query_stream>>>(
+          descriptors.data(), bases.data(), active_handles.data(),
+          options.segments, query_counters.data());
     }
-    mark_done_kernel<<<1, 1, 0, publisher_stream>>>(
-        publication_done.data());
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(stop, publisher_stream));
     CUDA_CHECK(cudaEventSynchronize(stop));

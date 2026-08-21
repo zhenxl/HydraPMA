@@ -189,7 +189,17 @@ Completed and compiled for CUDA 12.9 / `sm_90a`:
 - `67e433e`: immutable replacement descriptors, versioned COW publication,
   and concurrent snapshot validation.
 
-The GitHub CUDA container verifies compilation only. Runtime correctness,
-throughput, crossover thresholds, CAS retry behavior, and profiler counters
-still require the H20 experiment matrices. No end-to-end speedup claim should
-be made from CI.
+H20 runtime validation on 2026-08-21 completed 126 one-level update rows,
+260 paired delta rows, and 26 COW publication rows with no correctness
+failures after sizing the monotonic delta pool for measured CAS-loser waste.
+Warp aggregation wins all Zipf points, with median speedups of 1.566x for
+grouped input and 1.230x for random input, but uniform/random has a 0.986x
+median and therefore requires adaptive dispatch.
+
+The original persistent-reader publication test did not have a portable
+cross-stream forward-progress guarantee on the H20 driver. It now launches a
+finite snapshot kernel per publication epoch and preserves overlap through a
+high-priority query stream. The full sweep reports zero partial snapshots and
+zero publication CAS failures. Epoch reclamation and integrated asynchronous
+compaction are still pending, so this is not yet a complete lock-free graph
+store.
