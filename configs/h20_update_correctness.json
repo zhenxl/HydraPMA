@@ -1,0 +1,29 @@
+{
+  "base_seed": 17,
+  "warmup": 2,
+  "iterations": 5,
+  "repetitions": 3,
+  "cases": [
+    {
+      "name": "uniform_semantics",
+      "vertices": 4096,
+      "segment_capacity": 512,
+      "densities": [0.5, 0.7, 0.9],
+      "batch_sizes": [1024, 10000],
+      "insert_ratios": [0.0, 0.5, 1.0],
+      "duplicate_ratios": [0.0, 0.25],
+      "distributions": ["uniform"]
+    },
+    {
+      "name": "zipf_hotspot",
+      "vertices": 4096,
+      "segment_capacity": 2048,
+      "densities": [0.25],
+      "batch_sizes": [1024, 5000],
+      "insert_ratios": [0.0, 0.5, 1.0],
+      "duplicate_ratios": [0.25],
+      "distributions": ["zipf"],
+      "zipf_skew": 1.1
+    }
+  ]
+}

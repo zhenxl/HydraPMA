@@ -1,0 +1,22 @@
+name: CUDA build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  sm90a:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y cmake ninja-build
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DHYDRAPMA_CUDA_ARCH=sm_90a
+      - name: Build
+        run: cmake --build build --target segment_bench update_bench -j 2

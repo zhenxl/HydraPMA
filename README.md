@@ -82,8 +82,31 @@ result.
 The benchmark emits measured data only.  It exits instead of silently labeling
 a non-Hopper path as TMA when `sm_90a` support is absent.
 
+The first end-to-end one-level update baseline is:
+
+```bash
+./build/update_bench --vertices 4096 --segment-capacity 256 \
+  --density 0.5 --batch-size 65536 --insert-ratio 0.5 \
+  --duplicate-ratio 0.1 --distribution uniform
+```
+
+It sorts and resolves conflicting updates on the GPU, builds affected-segment
+offsets, merges insertions/deletions into gapped segments, and compares every
+result with an independent CPU last-write-wins reference. Its phase-serial
+per-segment merge is the correctness baseline for adaptive and lock-free paths.
+
+Run the initial semantics matrix with:
+
+```bash
+python3 scripts/run_update_sweep.py --binary ./build/update_bench \
+  --config configs/h20_update_correctness.json \
+  --output results/h20_update_correctness.csv
+```
+
 See `docs/h20_initial_results.md` for the first H20 measurements and Nsight
 diagnosis, `docs/hopper_dynamic_graph_research.md` for the CPU-to-Hopper research
 roadmap, `docs/hydrapma_ideas_technical_update.md` for the consolidated
 baseline ideas, kernel details, and current progress, and
-`docs/experiment_plan.md` for the original experiment plan.
+`docs/experiment_plan.md` for the original experiment plan. The staged
+end-to-end adaptive and non-blocking implementation is specified in
+`docs/lockfree_implementation_plan.md`.
