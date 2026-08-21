@@ -21,4 +21,5 @@ jobs:
       - name: Build
         run: >-
           cmake --build build
-          --target segment_bench update_bench lockfree_delta_bench -j 2
+          --target segment_bench update_bench lockfree_delta_bench
+          publication_bench -j 2

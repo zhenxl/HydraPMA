@@ -33,3 +33,11 @@ target_compile_options(lockfree_delta_bench PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-O3>
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
 )
+
+add_executable(publication_bench src/publication_bench.cu)
+target_compile_features(publication_bench PRIVATE cxx_std_17 cuda_std_17)
+target_compile_options(publication_bench PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-arch=${HYDRAPMA_CUDA_ARCH}>
+  $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+)

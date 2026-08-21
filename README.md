@@ -129,6 +129,20 @@ python3 scripts/run_lockfree_sweep.py \
   --output results/h20_lockfree_delta_sweep.csv
 ```
 
+The COW publication microbenchmark runs readers concurrently with replacement
+segment construction:
+
+```bash
+./build/publication_bench --segments 256 --capacity 256 \
+  --epochs 32 --repetitions 5
+```
+
+Replacement bases and descriptors are immutable. A publisher fences the fully
+built replacement before a versioned-handle CAS. Readers accept a snapshot only
+when the active handle is unchanged across traversal; the benchmark reports
+handle-change retries and treats any accepted partial-generation snapshot as a
+correctness failure.
+
 See `docs/h20_initial_results.md` for the first H20 measurements and Nsight
 diagnosis, `docs/hopper_dynamic_graph_research.md` for the CPU-to-Hopper research
 roadmap, `docs/hydrapma_ideas_technical_update.md` for the consolidated
