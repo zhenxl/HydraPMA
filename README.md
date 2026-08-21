@@ -108,6 +108,20 @@ python3 scripts/run_update_sweep.py --binary ./build/update_bench \
   --output results/h20_update_correctness.csv
 ```
 
+The first non-blocking delta prototype compares one reservation atomic per edge
+with warp aggregation:
+
+```bash
+./build/lockfree_delta_bench --vertices 1024 --block-capacity 32 \
+  --batch-size 65536 --input-order grouped --mode all
+```
+
+Each vertex publishes a 64-bit generation-tagged active-block handle. Writers
+reserve slots without a segment lock, write the payload, then publish a READY
+word. A full block is sealed by installing a fresh block with CAS; losing CAS
+allocations are not reused in this milestone. Validation walks every generation
+chain and requires every input sequence to appear exactly once.
+
 See `docs/h20_initial_results.md` for the first H20 measurements and Nsight
 diagnosis, `docs/hopper_dynamic_graph_research.md` for the CPU-to-Hopper research
 roadmap, `docs/hydrapma_ideas_technical_update.md` for the consolidated

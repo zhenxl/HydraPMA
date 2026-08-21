@@ -19,4 +19,6 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -G Ninja -DHYDRAPMA_CUDA_ARCH=sm_90a
       - name: Build
-        run: cmake --build build --target segment_bench update_bench -j 2
+        run: >-
+          cmake --build build
+          --target segment_bench update_bench lockfree_delta_bench -j 2
