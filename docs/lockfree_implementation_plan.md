@@ -203,3 +203,10 @@ high-priority query stream. The full sweep reports zero partial snapshots and
 zero publication CAS failures. Epoch reclamation and integrated asynchronous
 compaction are still pending, so this is not yet a complete lock-free graph
 store.
+
+The first adaptive delta dispatcher is also complete. It combines estimated
+within-warp source grouping, hottest-source fraction, and a large-batch
+threshold. The final H20 matrix has zero failures and selects the faster path
+for all 17 configurations whose five-seed medians differ by at least 2%.
+Feature extraction is still host-side in the synthetic harness; moving these
+statistics into the GPU planner is required before an end-to-end claim.

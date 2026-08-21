@@ -259,3 +259,55 @@ round trip. Increasing occupancy alone is not supported by these counters.
    reduce the 64/256 overprovisioning factors and measure allocator traffic.
 4. Extend publication measurements with query amplification and epoch-based
    reclamation before claiming full lock-free storage.
+
+## Adaptive delta dispatch follow-up
+
+The first item above was implemented and measured on the same H20. The
+dispatcher uses three batch features:
+
+- estimated unique source groups per input warp;
+- maximum single-source fraction of the batch;
+- total batch size.
+
+The measured default policy is:
+
+```text
+batch < 4K
+    -> atomic
+batch >= 100K
+    -> warp aggregated
+otherwise, group ratio <= 0.1 or hottest source >= 5%
+    -> warp aggregated
+otherwise
+    -> atomic
+```
+
+`all` mode measures atomic and warp once, then relabels the selected result
+as `adaptive_atomic` or `adaptive_warp`. It does not run a biased third
+timing sample. Standalone `adaptive` mode launches only the selected kernel.
+
+The final v4 sweep has 390 rows: 130 atomic/warp pairs plus one adaptive result
+per pair, with zero correctness failures. Because these kernels can be only a
+few microseconds, selection quality is evaluated by taking the median across
+five seeds for each of the 26 configurations.
+
+| Adaptive metric | Value |
+|---|---:|
+| materially different configurations (>=2%) | 17 / 26 |
+| correct choices on material configurations | 100% |
+| median speedup versus always atomic | 1.014x |
+| median speedup versus always warp | 1.000x |
+| P95 regret versus per-configuration oracle | 0.771% |
+| maximum regret | 1.764% |
+
+All Zipf configurations route to warp aggregation. Uniform 1K and 10K route
+to atomic except that every 100K configuration routes to warp. The 10K
+uniform/grouped region gives warp only a small median advantage; keeping it on
+atomic trades at most 1.8% in these measurements for a much lower tail risk.
+
+The feature calculation is currently host-side and outside `append_ms`
+because the synthetic benchmark already owns the generated update batch.
+This validates the routing rule, not a zero-cost production dispatcher. The
+next integration should emit group count and hotspot statistics during the
+GPU sort/bucket planner and route descriptor queues without a host
+synchronization.

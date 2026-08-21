@@ -41,6 +41,10 @@ struct Options {
   double insert_ratio = 0.5;
   double zipf_skew = 1.1;
   unsigned int pool_factor = 4;
+  double adaptive_group_ratio = 0.1;
+  double adaptive_hot_fraction = 0.05;
+  std::size_t adaptive_min_batch = 4096;
+  std::size_t adaptive_large_batch = 100000;
   std::uint64_t seed = 19;
   int warmup = 2;
   int iterations = 5;
@@ -232,6 +236,38 @@ std::vector<DeltaRecord> make_updates(const Options& options) {
   return updates;
 }
 
+double estimate_warp_group_ratio(
+    const std::vector<DeltaRecord>& updates) {
+  std::size_t groups = 0;
+  for (std::size_t warp_begin = 0; warp_begin < updates.size();
+       warp_begin += 32) {
+    const std::size_t warp_end =
+        std::min(warp_begin + 32, updates.size());
+    for (std::size_t lane = warp_begin; lane < warp_end; ++lane) {
+      bool first = true;
+      for (std::size_t prior = warp_begin; prior < lane; ++prior) {
+        if (updates[prior].src == updates[lane].src) {
+          first = false;
+          break;
+        }
+      }
+      groups += first ? 1 : 0;
+    }
+  }
+  return static_cast<double>(groups) / updates.size();
+}
+
+double estimate_hot_source_fraction(
+    const std::vector<DeltaRecord>& updates,
+    unsigned int vertices) {
+  std::vector<std::size_t> counts(vertices, 0);
+  std::size_t maximum = 0;
+  for (const DeltaRecord& update : updates) {
+    maximum = std::max(maximum, ++counts[update.src]);
+  }
+  return static_cast<double>(maximum) / updates.size();
+}
+
 Options parse_options(int argc, char** argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
@@ -259,6 +295,14 @@ Options parse_options(int argc, char** argv) {
       options.zipf_skew = std::stod(value(argv[i]));
     } else if (!std::strcmp(argv[i], "--pool-factor")) {
       options.pool_factor = std::stoul(value(argv[i]));
+    } else if (!std::strcmp(argv[i], "--adaptive-group-ratio")) {
+      options.adaptive_group_ratio = std::stod(value(argv[i]));
+    } else if (!std::strcmp(argv[i], "--adaptive-hot-fraction")) {
+      options.adaptive_hot_fraction = std::stod(value(argv[i]));
+    } else if (!std::strcmp(argv[i], "--adaptive-min-batch")) {
+      options.adaptive_min_batch = std::stoull(value(argv[i]));
+    } else if (!std::strcmp(argv[i], "--adaptive-large-batch")) {
+      options.adaptive_large_batch = std::stoull(value(argv[i]));
     } else if (!std::strcmp(argv[i], "--seed")) {
       options.seed = std::stoull(value(argv[i]));
     } else if (!std::strcmp(argv[i], "--warmup")) {
@@ -269,8 +313,11 @@ Options parse_options(int argc, char** argv) {
       std::puts(
           "lockfree_delta_bench [--vertices N] [--block-capacity N] "
           "[--batch-size N] [--input-order grouped|random] "
-          "[--distribution uniform|zipf] [--mode all|atomic|warp] "
+          "[--distribution uniform|zipf] "
+          "[--mode all|atomic|warp|adaptive] "
           "[--insert-ratio F] [--zipf-skew F] [--pool-factor N] "
+          "[--adaptive-group-ratio F] [--adaptive-hot-fraction F] "
+          "[--adaptive-min-batch N] [--adaptive-large-batch N] "
           "[--seed N] [--warmup N] [--iterations N]");
       std::exit(0);
     } else {
@@ -291,17 +338,25 @@ Options parse_options(int argc, char** argv) {
     throw std::runtime_error("distribution must be uniform or zipf");
   }
   if (options.mode != "all" && options.mode != "atomic" &&
-      options.mode != "warp") {
-    throw std::runtime_error("mode must be all, atomic, or warp");
+      options.mode != "warp" && options.mode != "adaptive") {
+    throw std::runtime_error(
+        "mode must be all, atomic, warp, or adaptive");
   }
-  if ((options.mode == "all" || options.mode == "warp") &&
+  if ((options.mode == "all" || options.mode == "warp" ||
+       options.mode == "adaptive") &&
       options.block_capacity < 32) {
     throw std::runtime_error(
         "warp mode requires block capacity of at least 32");
   }
   if (!(options.insert_ratio >= 0.0 && options.insert_ratio <= 1.0) ||
       options.zipf_skew <= 0.0 || options.warmup < 0 ||
-      options.iterations <= 0) {
+      options.iterations <= 0 ||
+      !(options.adaptive_group_ratio > 0.0 &&
+        options.adaptive_group_ratio <= 1.0) ||
+      !(options.adaptive_hot_fraction > 0.0 &&
+        options.adaptive_hot_fraction <= 1.0) ||
+      options.adaptive_min_batch == 0 ||
+      options.adaptive_large_batch == 0) {
     throw std::runtime_error("invalid ratio, skew, or iteration count");
   }
   return options;
@@ -491,7 +546,8 @@ Result run_mode(
     DeviceBuffer<unsigned long long>& previous_handles,
     DeviceBuffer<DeltaRecord>& records, DeviceBuffer<unsigned int>& ready,
     DeviceBuffer<unsigned int>& next_block,
-    DeviceBuffer<Counters>& counters) {
+    DeviceBuffer<Counters>& counters,
+    const char* result_mode = nullptr) {
   cudaEvent_t start{};
   cudaEvent_t stop{};
   CUDA_CHECK(cudaEventCreate(&start));
@@ -523,7 +579,10 @@ Result run_mode(
   }
 
   Result result;
-  result.mode = warp_grouped ? "warp" : "atomic";
+  result.mode =
+      result_mode != nullptr
+          ? result_mode
+          : (warp_grouped ? "warp" : "atomic");
   result.append_ms = measured_ms / options.iterations;
   CUDA_CHECK(cudaMemcpy(&result.blocks_used, next_block.data(),
                         sizeof(unsigned int), cudaMemcpyDeviceToHost));
@@ -546,6 +605,14 @@ int run_benchmark(const Options& options) {
   cudaDeviceProp properties{};
   CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
   const std::vector<DeltaRecord> updates = make_updates(options);
+  const double group_ratio = estimate_warp_group_ratio(updates);
+  const double hot_fraction =
+      estimate_hot_source_fraction(updates, options.vertices);
+  const bool adaptive_warp =
+      options.batch_size >= options.adaptive_min_batch &&
+      (options.batch_size >= options.adaptive_large_batch ||
+       group_ratio <= options.adaptive_group_ratio ||
+       hot_fraction >= options.adaptive_hot_fraction);
 
   const std::size_t minimum_rollovers =
       (options.batch_size + options.block_capacity - 1) /
@@ -599,9 +666,35 @@ int run_benchmark(const Options& options) {
         block_tails, block_sealed, block_owner, block_generation,
         previous_handles, records, ready, next_block, counters));
   }
+  if (options.mode == "all") {
+    Result adaptive = adaptive_warp ? results[1] : results[0];
+    adaptive.mode =
+        adaptive_warp ? "adaptive_warp" : "adaptive_atomic";
+    results.push_back(adaptive);
+  } else if (options.mode == "adaptive") {
+    if (adaptive_warp) {
+      results.push_back(run_mode<true>(
+          options, updates, max_blocks, device_updates, active_handles,
+          block_tails, block_sealed, block_owner, block_generation,
+          previous_handles, records, ready, next_block, counters,
+          "adaptive_warp"));
+    } else {
+      results.push_back(run_mode<false>(
+          options, updates, max_blocks, device_updates, active_handles,
+          block_tails, block_sealed, block_owner, block_generation,
+          previous_handles, records, ready, next_block, counters,
+          "adaptive_atomic"));
+    }
+  }
 
   std::fprintf(stderr, "# gpu=%s max_blocks=%u record_slots=%zu\n",
                properties.name, max_blocks, record_slots);
+  std::fprintf(
+      stderr,
+      "# estimated_group_ratio=%.6f hot_fraction=%.6f adaptive=%s",
+      group_ratio, hot_fraction,
+      adaptive_warp ? "warp" : "atomic");
+  std::fputc(10, stderr);
   std::puts(
       "benchmark,mode,input_order,distribution,vertices,block_capacity,"
       "batch_size,blocks_used,reservation_atomics,rollover_attempts,"

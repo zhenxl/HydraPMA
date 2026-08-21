@@ -122,6 +122,11 @@ word. A full block is sealed by installing a fresh block with CAS; losing CAS
 allocations are not reused in this milestone. Validation walks every generation
 chain and requires every input sequence to appear exactly once.
 
+`--mode adaptive` selects the per-edge or warp-aggregated reservation path
+from batch size, within-warp source grouping, and hottest-source fraction.
+`--mode all` emits both native paths plus the selected adaptive row for
+direct oracle-regret analysis.
+
 ```bash
 python3 scripts/run_lockfree_sweep.py \
   --binary ./build/lockfree_delta_bench \

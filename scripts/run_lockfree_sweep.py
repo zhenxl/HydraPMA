@@ -70,7 +70,8 @@ def main() -> int:
                         command, check=True, text=True, capture_output=True
                     )
                     rows = list(csv.DictReader(completed.stdout.splitlines()))
-                    if {row["mode"] for row in rows} != {"atomic", "warp"}:
+                    modes = {row["mode"] for row in rows}
+                    if not {"atomic", "warp"}.issubset(modes):
                         raise RuntimeError(f"missing comparison rows: {command}")
                     for row in rows:
                         if set(row) != set(BINARY_FIELDS):
